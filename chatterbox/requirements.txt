@@ -1,0 +1,7 @@
+chatterbox-tts
+torch
+torchaudio
+fastapi
+uvicorn[standard]
+websockets
+python-multipart

@@ -1,0 +1,26 @@
+moondream/
+orpheus/
+whisper/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Models / checkpoints (large binaries)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.pkl
+*.bin
+*.safetensors
+
+# Env
+.env
+*.env
+
+# Logs
+*.log

@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html>
+<head><title>Ditto Frame Viewer (No LiveKit)</title></head>
+<body style="background:#111;color:#fff;font-family:monospace;display:flex;flex-direction:column;align-items:center;padding:20px">
+  <h2>Ditto Direct Frame Viewer</h2>
+  <div style="margin:10px">
+    <button onclick="startTest()" id="btn" style="padding:10px 20px;font-size:16px">Start Test (5s audio)</button>
+    <span id="status" style="margin-left:15px">Ready</span>
+  </div>
+  <canvas id="cv" width="340" height="512" style="border:1px solid #444"></canvas>
+  <div id="stats" style="margin-top:10px;font-size:14px"></div>
+  <audio id="aud" style="display:none"></audio>
+
+  <script>
+const DITTO_URL = location.origin;
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const status = document.getElementById('status');
+const stats = document.getElementById('stats');
+
+async function startTest() {
+  document.getElementById('btn').disabled = true;
+  status.textContent = 'Generating...';
+
+  const wsUrl = DITTO_URL.replace('https://', 'wss://').replace('http://', 'ws://') + '/ws/test_frames?avatar_id=imogen&duration=5';
+  const ws = new WebSocket(wsUrl);
+
+  let frames = [];
+  let audioBlob = null;
+
+  ws.binaryType = 'arraybuffer';
+
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'audio') {
+        const bin = atob(msg.data);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        audioBlob = new Blob([bytes], {type: 'audio/wav'});
+        status.textContent = `Got audio (${msg.duration.toFixed(1)}s), receiving frames...`;
+      } else if (msg.type === 'frame_count') {
+        status.textContent = `Playing ${msg.count} frames at ${msg.fps}fps...`;
+        playback(frames, audioBlob, msg.fps);
+      }
+    } else {
+      frames.push(e.data);
+      if (frames.length % 25 === 0) status.textContent = `Received ${frames.length} frames...`;
+    }
+  };
+
+  ws.onerror = () => { status.textContent = 'WebSocket error'; };
+}
+
+async function playback(frames, audioBlob, fps) {
+  const interval = 1000 / fps; // 40ms at 25fps
+
+  // Pre-decode all frames as ImageBitmap for fast rendering
+  const bitmaps = await Promise.all(frames.map(f => {
+    const blob = new Blob([f], {type: 'image/jpeg'});
+    return createImageBitmap(blob);
+  }));
+
+  if (bitmaps.length > 0) {
+    cv.width = bitmaps[0].width;
+    cv.height = bitmaps[0].height;
+  }
+
+  // Play audio
+  if (audioBlob) {
+    const aud = document.getElementById('aud');
+    aud.src = URL.createObjectURL(audioBlob);
+    aud.play();
+  }
+
+  // Pace frames using setInterval at exact FPS
+  const t0 = performance.now();
+  let frameIdx = 0;
+
+  const timer = setInterval(() => {
+    if (frameIdx >= bitmaps.length) {
+      clearInterval(timer);
+      const totalTime = performance.now() - t0;
+      stats.innerHTML = `Done: ${bitmaps.length} frames in ${(totalTime/1000).toFixed(2)}s<br>` +
+        `Target FPS: ${fps} (${interval}ms/frame), Measured: ${(bitmaps.length / (totalTime/1000)).toFixed(1)}fps`;
+      document.getElementById('btn').disabled = false;
+      status.textContent = 'Done';
+      return;
+    }
+
+    ctx.drawImage(bitmaps[frameIdx], 0, 0);
+    frameIdx++;
+  }, interval);
+}
+  </script>
+</body>
+</html>

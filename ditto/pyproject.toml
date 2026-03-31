@@ -1,0 +1,89 @@
+[project]
+name = "ditto-avatar-server"
+version = "0.1.0"
+description = "Ditto TalkingHead GPU Inference Server"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # Core ML framework
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "torchaudio==2.8.0",
+
+    # Audio processing
+    "librosa==0.10.2.post1",
+    "soundfile==0.13.0",
+    "soxr>=0.5.0",
+    "scipy>=1.15.0",
+
+    # Image / video processing
+    "opencv-python-headless>=4.10.0",
+    "Pillow>=11.0.0",
+    "imageio>=2.36.0",
+    "imageio-ffmpeg>=0.5.1",
+    "scikit-image>=0.25.0",
+    "mediapipe>=0.10.0",
+    "filetype>=1.2.0",
+
+    # Numeric / scientific
+    "numpy>=2.0.1",
+    "numba>=0.60.0",
+    "llvmlite>=0.43.0",
+    "scikit-learn>=1.6.0",
+    "einops>=0.8.0",
+
+    # Web server
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
+    "httpx>=0.24.0",
+    "pydantic>=2.0.0",
+
+    # LiveKit SDK
+    "livekit>=1.0.0",
+
+    # ONNX Runtime
+    "onnxruntime>=1.18.0",
+
+    # TensorRT inference (cu12 variant for CUDA 12.x drivers)
+    "tensorrt-cu12>=10.7,<10.8",
+    "tensorrt-cu12-bindings>=10.7,<10.8",
+    "tensorrt-cu12-libs>=10.7,<10.8",
+    "cuda-python>=12.6.0,<13",
+    "polygraphy",
+    "colored",
+
+    # Utilities
+    "pyyaml>=6.0",
+    "tqdm>=4.67.0",
+    "Cython>=3.0.0",
+    "joblib>=1.4.0",
+]
+
+[tool.uv.sources]
+tensorrt-cu12 = [
+    { index = "nvidia" },
+]
+tensorrt-cu12-bindings = [
+    { index = "nvidia" },
+]
+tensorrt-cu12-libs = [
+    { index = "nvidia" },
+]
+torch = [
+    { index = "pytorch-cu128" },
+]
+torchvision = [
+    { index = "pytorch-cu128" },
+]
+torchaudio = [
+    { index = "pytorch-cu128" },
+]
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
