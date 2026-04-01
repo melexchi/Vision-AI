@@ -9,11 +9,15 @@ import sys
 import json
 import base64
 import asyncio
+import logging
 import threading
 import tempfile
 import time
 import uuid
 import io
+
+logger = logging.getLogger("chatterbox")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
 from pathlib import Path
 from typing import Optional
 
@@ -49,10 +53,10 @@ def get_multilingual_model():
     if multilingual_model is None:
         with _model_lock:
             if multilingual_model is None:  # double-check after acquiring lock
-                print("Loading Chatterbox Multilingual model...")
+                logger.info("Loading Chatterbox Multilingual model...")
                 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
                 multilingual_model = ChatterboxMultilingualTTS.from_pretrained(device="cuda")
-                print("Chatterbox Multilingual model loaded!")
+                logger.info("Chatterbox Multilingual model loaded!")
     return multilingual_model
 
 
@@ -62,22 +66,22 @@ def get_turbo_model():
     if turbo_model is None:
         with _model_lock:
             if turbo_model is None:  # double-check after acquiring lock
-                print("Loading Chatterbox Turbo model...")
+                logger.info("Loading Chatterbox Turbo model...")
                 from chatterbox.tts_turbo import ChatterboxTurboTTS
                 turbo_model = ChatterboxTurboTTS.from_pretrained(device="cuda")
-                print("Chatterbox Turbo model loaded!")
+                logger.info("Chatterbox Turbo model loaded!")
     return turbo_model
 
 
 @app.on_event("startup")
 async def startup():
     """Pre-load model on startup"""
-    print("Starting Chatterbox TTS API server...")
+    logger.info("Starting Chatterbox TTS API server...")
     print("Loading Chatterbox Multilingual model...")
     get_multilingual_model()
     print("Loading Chatterbox Turbo model...")
     get_turbo_model()
-    print("All models loaded successfully!")
+    logger.info("All models loaded successfully!")
 
 
 @app.get("/health")
@@ -153,7 +157,7 @@ async def generate_tts(
         )
 
     except Exception as e:
-        print(f"[error] TTS generation failed: {e}")
+        logger.info(f"[error] TTS generation failed: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -179,9 +183,19 @@ async def websocket_endpoint(websocket: WebSocket):
     voice_prompt_path: Optional[Path] = None
     model = get_turbo_model()
 
+    WS_IDLE_TIMEOUT = 300  # 5 min idle timeout
+    WS_MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB max message
+
     try:
         while True:
-            data = await websocket.receive_text()
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=WS_IDLE_TIMEOUT)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "error", "message": "Idle timeout (5 min)"})
+                break
+            if len(data) > WS_MAX_MESSAGE_SIZE:
+                await websocket.send_json({"type": "error", "message": "Message too large"})
+                continue
             msg = json.loads(data)
             msg_type = msg.get("type")
 
@@ -288,9 +302,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
 
     except WebSocketDisconnect:
-        print(f"Session {session_id} disconnected")
+        logger.info(f"Session {session_id} disconnected")
     except Exception as e:
-        print(f"Session {session_id} error: {e}")
+        logger.info(f"Session {session_id} error: {e}")
         try:
             await websocket.send_json({"type": "error", "message": str(e)})
         except Exception:
@@ -308,5 +322,5 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8081)
     args = parser.parse_args()
 
-    print(f"Starting Chatterbox TTS API server on {args.host}:{args.port}")
+    logger.info(f"Starting Chatterbox TTS API server on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)

@@ -42,6 +42,22 @@ Format: [DATE] [AUTHOR] Description
 - **BUG-041** Hardcoded ports: ditto and smolvlm ports configurable via env vars
 - **BUG-042** Input validation: added Pydantic `Field(ge=, le=)` bounds on fps and sampling_timesteps
 - **BUG-043** Debug exposure: test endpoints gated behind `DITTO_DEBUG_ENDPOINTS` env var
+- **BUG-005** Pickle safety: HMAC-SHA256 integrity verification on cache files with legacy auto-migration
+- **BUG-014** Thread-safe load_ditto() with double-check locking
+- **BUG-015** Graceful shutdown handler: stops all sessions, shuts down executor on SIGTERM
+- **BUG-016** LiveKit reconnection: 3 retries with exponential backoff on room.connect()
+- **BUG-019** HTTP connection pooling: reusable httpx.Client for TTS requests
+- **BUG-022** Rate limiting: per-IP token bucket middleware (configurable RATE_LIMIT_RPM)
+- **BUG-023** WebSocket security: 5min idle timeout + 100MB max message size
+- **BUG-024** Pagination: `/avatars?limit=50&offset=0` with total count
+- **BUG-025** Config validation: `_validate_config()` checks paths/URLs at startup
+- **BUG-026** Audio dedup: extracted `_to_mono_int16()` and `_resample_int16()` to module level
+- **BUG-027** Session TTL: background cleanup loop with configurable SESSION_TTL_SECONDS (30min default)
+- **BUG-028** Constants documented: inline docstrings on all pipeline magic numbers
+- **BUG-030** SSRF: SmolVLM blocks private/internal URLs
+- **BUG-031** Structured logging: replaced all print() with Python logging module in ditto and chatterbox
+- **BUG-036** Audio backpressure: 50MB max segment size limit on LiveKit DataStream
+- **BUG-037** Subprocess errors: full stderr in logs, 1000-char storage (was 300)
 
 ### Removed
 

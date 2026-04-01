@@ -17,6 +17,7 @@ import os
 import time
 import base64
 import math
+import logging
 import pickle
 import hashlib
 import shutil
@@ -28,6 +29,9 @@ import numpy as np
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
+
+logger = logging.getLogger("ditto")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
 
 # Add Ditto to path
 DITTO_PATH = Path(os.environ.get("DITTO_PATH", str(Path(__file__).resolve().parent / "ditto-talkinghead")))
@@ -54,6 +58,25 @@ except ImportError:
 app = FastAPI(title="Ditto Avatar API", version="2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# Simple in-memory rate limiter (per-IP, token bucket)
+_rate_limit_buckets: dict[str, list] = {}  # ip -> [timestamp, ...]
+RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))  # requests per minute
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    bucket = _rate_limit_buckets.setdefault(client_ip, [])
+    # Purge entries older than 60s
+    bucket[:] = [t for t in bucket if now - t < 60]
+    if len(bucket) >= RATE_LIMIT_RPM:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+    bucket.append(now)
+    return await call_next(request)
+
+
 # Global instances
 ditto_sdk = None
 avatar_cache: dict[str, dict] = {}  # avatar_id -> source_info
@@ -71,19 +94,32 @@ CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 IMAGES_DIR = Path(os.environ.get("AVATAR_IMAGES_DIR", "/workspace/avatar_images"))
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
-# Default optimized settings
-DEFAULT_SAMPLING_TIMESTEPS = 5  # streaming mode has ~2x overhead vs offline; 5 steps = ~25-30 it/s streaming
+# ─── Pipeline Defaults ─────────────────────────────────────────────
+# DDIM diffusion steps for lip-sync generation. 5 steps balances quality/speed
+# at ~25-30 iterations/sec in streaming mode (vs 50 steps offline default).
+DEFAULT_SAMPLING_TIMESTEPS = 5
+# Video frame rate. 25fps matches the Ditto training data and LiveKit VP8 output.
 DEFAULT_FPS = 25
+# Audio is delayed 5 frames (200ms at 25fps) relative to video to hide the
+# LMDM diffusion model's initial ramp-up latency on the first few frames.
+AUDIO_DELAY_FRAMES = 5
 
-AUDIO_DELAY_FRAMES = 5  # Delay audio 5 frames (200ms) to hide LMDM D0 ramp-up
-
-# Orpheus TTS server
+# ─── TTS Integration ──────────────────────────────────────────────
 TTS_URL = os.environ.get("TTS_URL", "http://localhost:8282/tts/stream")
-TTS_SAMPLE_RATE = 24000
-DITTO_SAMPLE_RATE = 16000
-CHUNK_SAMPLES_24K = 9720   # 0.405s @ 24kHz
-CHUNK_SAMPLES_16K = 6480   # 0.405s @ 16kHz
-WAV_HEADER_SIZE = 44
+_tts_http_client: httpx.Client | None = None
+
+
+def _get_tts_client() -> httpx.Client:
+    """Get or create a reusable httpx client for TTS requests (connection pooling)."""
+    global _tts_http_client
+    if _tts_http_client is None or _tts_http_client.is_closed:
+        _tts_http_client = httpx.Client(timeout=120.0, limits=httpx.Limits(max_keepalive_connections=5))
+    return _tts_http_client
+TTS_SAMPLE_RATE = 24000     # Chatterbox TTS outputs 24kHz audio
+DITTO_SAMPLE_RATE = 16000   # Ditto's HuBERT expects 16kHz input
+CHUNK_SAMPLES_24K = 9720    # 0.405s chunk at 24kHz (matches streaming granularity)
+CHUNK_SAMPLES_16K = 6480    # 0.405s chunk at 16kHz (24kHz resampled by 2/3)
+WAV_HEADER_SIZE = 44        # Standard WAV header size to skip in streaming TTS
 
 # Larger chunk processing for better HuBERT feature rate.
 # Standard chunksize=(3,5,2) yields only 5 features per 6480-sample chunk (12.3 feat/s).
@@ -179,6 +215,28 @@ def _validate_file_path(user_path: str) -> Path:
     raise HTTPException(status_code=400, detail=f"Path not allowed: {user_path}")
 
 
+def _to_mono_int16(pcm: np.ndarray, num_channels: int) -> np.ndarray:
+    """Convert interleaved PCM int16 to mono int16."""
+    if num_channels <= 1:
+        return pcm
+    usable = (len(pcm) // num_channels) * num_channels
+    if usable <= 0:
+        return np.zeros((0,), dtype=np.int16)
+    pcm = pcm[:usable].reshape(-1, num_channels).astype(np.int32)
+    return np.mean(pcm, axis=1).clip(-32768, 32767).astype(np.int16)
+
+
+def _resample_int16(pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """Resample PCM int16 using polyphase filtering."""
+    if src_sr == dst_sr or len(pcm) == 0:
+        return pcm
+    g = math.gcd(src_sr, dst_sr)
+    up = dst_sr // g
+    down = src_sr // g
+    out = resample_poly(pcm.astype(np.float64), up, down)
+    return np.round(out).clip(-32768, 32767).astype(np.int16)
+
+
 def _image_hash(image_path: str) -> str:
     """Generate a stable avatar_id from image contents."""
     with open(image_path, "rb") as f:
@@ -189,22 +247,50 @@ def _cache_path(avatar_id: str) -> Path:
     return CACHE_DIR / f"{avatar_id}.pkl"
 
 
+import hmac as _hmac
+
+# Secret for HMAC pickle validation — prevents loading tampered cache files.
+# In production, set PICKLE_HMAC_SECRET env var to a random value.
+_PICKLE_SECRET = os.environ.get("PICKLE_HMAC_SECRET", "ditto-avatar-cache-default-key").encode()
+
+
 def _save_cache(avatar_id: str, source_info: dict):
-    """Persist source_info to disk atomically (write to .tmp, then rename)."""
+    """Persist source_info to disk atomically with HMAC integrity check."""
     final_path = _cache_path(avatar_id)
     tmp_path = final_path.with_suffix(".pkl.tmp")
+    data = pickle.dumps(source_info, protocol=pickle.HIGHEST_PROTOCOL)
+    sig = _hmac.new(_PICKLE_SECRET, data, "sha256").digest()
     with open(tmp_path, "wb") as f:
-        pickle.dump(source_info, f, protocol=pickle.HIGHEST_PROTOCOL)
+        f.write(sig)  # 32-byte HMAC prefix
+        f.write(data)
     tmp_path.replace(final_path)
 
 
 def _load_cache(avatar_id: str) -> dict | None:
-    """Load source_info from disk."""
+    """Load source_info from disk with HMAC integrity verification."""
     path = _cache_path(avatar_id)
-    if path.exists():
-        with open(path, "rb") as f:
-            return pickle.load(f)
-    return None
+    if not path.exists():
+        return None
+    with open(path, "rb") as f:
+        content = f.read()
+    if len(content) < 32:
+        logger.info(f"[cache] WARNING: {path} too small, skipping")
+        return None
+    stored_sig = content[:32]
+    data = content[32:]
+    expected_sig = _hmac.new(_PICKLE_SECRET, data, "sha256").digest()
+    if not _hmac.compare_digest(stored_sig, expected_sig):
+        # Legacy file without HMAC — load but re-save with HMAC
+        logger.info(f"[cache] {path.name}: no valid HMAC (legacy file), loading and re-signing...")
+        try:
+            with open(path, "rb") as f:
+                result = pickle.load(f)
+            _save_cache(avatar_id, result)  # re-save with HMAC
+            return result
+        except Exception as e:
+            logger.info(f"[cache] WARNING: Failed to load legacy cache {path}: {e}")
+            return None
+    return pickle.loads(data)
 
 
 def _warm_load_all():
@@ -217,10 +303,10 @@ def _warm_load_all():
                 data = pickle.load(f)
             with avatar_cache_lock:
                 avatar_cache[avatar_id] = data
-            print(f"  Loaded cached avatar: {avatar_id}")
+            logger.info(f"  Loaded cached avatar: {avatar_id}")
         except Exception as e:
-            print(f"  Failed to load cache {pkl_file}: {e}")
-    print(f"Loaded {len(avatar_cache)} cached avatars from disk")
+            logger.info(f"  Failed to load cache {pkl_file}: {e}")
+    logger.info(f"Loaded {len(avatar_cache)} cached avatars from disk")
 
 
 def _resolve_backend(backend: str) -> tuple[str, str]:
@@ -238,7 +324,7 @@ def _resolve_backend(backend: str) -> tuple[str, str]:
             elif (ckpt / "ditto_cfg" / "v0.4_hubert_cfg_trt_v10.pkl").exists():
                 return "v0.4_hubert_cfg_trt_v10.pkl", "ditto_trt_Ampere_Plus"
         else:
-            print(f"WARNING: DITTO_BACKEND=trt but no TRT engines found, falling back to pytorch")
+            logger.warning(f" DITTO_BACKEND=trt but no TRT engines found, falling back to pytorch")
             return "v0.4_hubert_cfg_pytorch.pkl", "ditto_pytorch"
     else:
         return "v0.4_hubert_cfg_pytorch.pkl", "ditto_pytorch"
@@ -261,9 +347,9 @@ def _setup_from_cache(self, source_info, output_path, **kwargs):
 
     # ======== Prepare Options ========
     kwargs = self._merge_kwargs(self.default_kwargs, kwargs)
-    print('=' * 20, 'setup_from_cache kwargs', '=' * 20)
+    logger.info('=' * 20 + ' setup_from_cache kwargs ' + '=' * 20)
     print_cfg(**kwargs)
-    print('=' * 50)
+    logger.info('=' * 50)
 
     # -- avatar_registrar: template cfg --
     self.max_size = kwargs.get('max_size', 1920)
@@ -413,21 +499,26 @@ class _QueueWriter:
         self._queue.put(None)
 
 
+_ditto_load_lock = threading.Lock()
+
+
 def load_ditto():
-    """Load Ditto SDK. Set DITTO_BACKEND=trt to use TensorRT engines."""
+    """Load Ditto SDK (thread-safe). Set DITTO_BACKEND=trt to use TensorRT engines."""
     global ditto_sdk
     if ditto_sdk is None:
-        from stream_pipeline_offline import StreamSDK
-        StreamSDK.setup_from_cache = _setup_from_cache
+        with _ditto_load_lock:
+            if ditto_sdk is None:  # double-check after acquiring lock
+                from stream_pipeline_offline import StreamSDK
+                StreamSDK.setup_from_cache = _setup_from_cache
 
-        backend = os.environ.get("DITTO_BACKEND", "onnx")
-        cfg_name, data_dir = _resolve_backend(backend)
+                backend = os.environ.get("DITTO_BACKEND", "onnx")
+                cfg_name, data_dir = _resolve_backend(backend)
 
-        cfg_pkl = str(DITTO_PATH / "checkpoints" / "ditto_cfg" / cfg_name)
-        data_root = str(DITTO_PATH / "checkpoints" / data_dir)
-        print(f"Loading Ditto SDK (backend={backend}, cfg={cfg_name})...")
-        ditto_sdk = StreamSDK(cfg_pkl=cfg_pkl, data_root=data_root)
-        print("Ditto SDK loaded!")
+                cfg_pkl = str(DITTO_PATH / "checkpoints" / "ditto_cfg" / cfg_name)
+                data_root = str(DITTO_PATH / "checkpoints" / data_dir)
+                logger.info(f"Loading Ditto SDK (backend={backend}, cfg={cfg_name})...")
+                ditto_sdk = StreamSDK(cfg_pkl=cfg_pkl, data_root=data_root)
+                logger.info("Ditto SDK loaded!")
     return ditto_sdk
 
 
@@ -440,13 +531,13 @@ def warmup_offline_pipeline():
 
     sdk = load_ditto()
     if not avatar_cache:
-        print("[warmup-offline] No cached avatars — skipping offline warmup")
+        logger.info("[warmup-offline] No cached avatars — skipping offline warmup")
         return
 
     avatar_id = next(iter(avatar_cache))
     source_info = avatar_cache[avatar_id]
 
-    print(f"[warmup-offline] Running dummy offline pipeline for torch.compile warmup (avatar={avatar_id})...")
+    logger.info(f"[warmup-offline] Running dummy offline pipeline for torch.compile warmup (avatar={avatar_id})...")
     t0 = time.time()
 
     tmp_output = "/tmp/ditto_warmup_offline.mp4"
@@ -467,7 +558,7 @@ def warmup_offline_pipeline():
     sdk.close()
 
     elapsed = time.time() - t0
-    print(f"[warmup-offline] Done in {elapsed:.1f}s — offline torch.compile warmed up")
+    logger.info(f"[warmup-offline] Done in {elapsed:.1f}s — offline torch.compile warmed up")
 
     # Clean up temp file
     for p in [tmp_output, tmp_output + ".tmp.mp4"]:
@@ -485,7 +576,7 @@ def _register_avatar(sdk, image_path: str, avatar_id: str | None = None) -> tupl
     # Check memory cache first
     with avatar_cache_lock:
         if avatar_id in avatar_cache:
-            print(f"Avatar {avatar_id} already cached (memory)")
+            logger.info(f"Avatar {avatar_id} already cached (memory)")
             return avatar_id, avatar_cache[avatar_id]
 
     # Check disk cache
@@ -493,15 +584,15 @@ def _register_avatar(sdk, image_path: str, avatar_id: str | None = None) -> tupl
     if cached is not None:
         with avatar_cache_lock:
             avatar_cache[avatar_id] = cached
-        print(f"Avatar {avatar_id} loaded from disk cache")
+        logger.info(f"Avatar {avatar_id} loaded from disk cache")
         return avatar_id, cached
 
     # Full registration (expensive - runs 4 models)
-    print(f"Registering new avatar {avatar_id} from {image_path}...")
+    logger.info(f"Registering new avatar {avatar_id} from {image_path}...")
     t0 = time.time()
     source_info = sdk.avatar_registrar.register(image_path, max_dim=512)
     elapsed = time.time() - t0
-    print(f"Registration complete in {elapsed:.2f}s")
+    logger.info(f"Registration complete in {elapsed:.2f}s")
 
     # Cache in memory + disk
     with avatar_cache_lock:
@@ -513,7 +604,7 @@ def _register_avatar(sdk, image_path: str, avatar_id: str | None = None) -> tupl
     if not persistent_img.exists():
         shutil.copy2(image_path, persistent_img)
 
-    print(f"Avatar {avatar_id} cached (memory + disk, ~{_estimate_size_mb(source_info):.1f} MB)")
+    logger.info(f"Avatar {avatar_id} cached (memory + disk, ~{_estimate_size_mb(source_info):.1f} MB)")
 
     return avatar_id, source_info
 
@@ -545,14 +636,14 @@ def _ensure_skyreels_setup(avatar_id: str) -> bool:
 
     setup_script = SKYREELS_PATH / "setup.sh"
     if not setup_script.exists():
-        print(f"[prerender] ERROR: {setup_script} not found — cannot auto-setup SkyReels-A1")
+        logger.info(f"[prerender] ERROR: {setup_script} not found — cannot auto-setup SkyReels-A1")
         with prerender_jobs_lock:
             prerender_jobs[avatar_id] = {"status": "failed", "error": "setup.sh not found"}
         return False
 
     with prerender_jobs_lock:
         prerender_jobs[avatar_id] = {"status": "setting_up", "started": time.time()}
-    print(f"[prerender] Running one-time SkyReels-A1 setup (may take 15-20 min)...")
+    logger.info(f"[prerender] Running one-time SkyReels-A1 setup (may take 15-20 min)...")
 
     try:
         result = subprocess.run(
@@ -563,11 +654,11 @@ def _ensure_skyreels_setup(avatar_id: str) -> bool:
             timeout=3600,  # 1 hour max for setup
         )
         if result.returncode != 0:
-            print(f"[prerender] Setup failed: {result.stderr[-500:]}")
+            logger.info(f"[prerender] Setup failed:\n{result.stderr}")
             with prerender_jobs_lock:
-                prerender_jobs[avatar_id] = {"status": "failed", "error": f"setup failed: {result.stderr[-300:]}"}
+                prerender_jobs[avatar_id] = {"status": "failed", "error": f"setup failed: {result.stderr[-1000:]}"}
             return False
-        print(f"[prerender] SkyReels-A1 setup complete.")
+        logger.info(f"[prerender] SkyReels-A1 setup complete.")
         return True
     except subprocess.TimeoutExpired:
         with prerender_jobs_lock:
@@ -588,7 +679,7 @@ def _run_prerender(avatar_id: str, image_path: str):
 
         with prerender_jobs_lock:
             prerender_jobs[avatar_id] = {"status": "running", "started": time.time()}
-        print(f"[prerender] Starting background clip generation for {avatar_id}")
+        logger.info(f"[prerender] Starting background clip generation for {avatar_id}")
 
         cmd = [
             str(SKYREELS_PYTHON), str(PRERENDER_SCRIPT),
@@ -612,23 +703,23 @@ def _run_prerender(avatar_id: str, image_path: str):
         if result.returncode == 0:
             with prerender_jobs_lock:
                 prerender_jobs[avatar_id] = {"status": "done", "finished": time.time()}
-            print(f"[prerender] Clips ready for {avatar_id}")
+            logger.info(f"[prerender] Clips ready for {avatar_id}")
         else:
             with prerender_jobs_lock:
                 prerender_jobs[avatar_id] = {
                     "status": "failed",
-                    "error": result.stderr[-500:] if result.stderr else "unknown error",
+                    "error": result.stderr[-1000:] if result.stderr else "unknown error",
                 }
-            print(f"[prerender] Failed for {avatar_id}: {result.stderr[-200:]}")
+            logger.info(f"[prerender] Failed for {avatar_id}:\n{result.stderr}")
 
     except subprocess.TimeoutExpired:
         with prerender_jobs_lock:
             prerender_jobs[avatar_id] = {"status": "failed", "error": "timeout (30min)"}
-        print(f"[prerender] Timeout for {avatar_id}")
+        logger.info(f"[prerender] Timeout for {avatar_id}")
     except Exception as e:
         with prerender_jobs_lock:
             prerender_jobs[avatar_id] = {"status": "failed", "error": str(e)}
-        print(f"[prerender] Error for {avatar_id}: {e}")
+        logger.info(f"[prerender] Error for {avatar_id}: {e}")
 
 
 def _start_prerender(avatar_id: str, image_path: str):
@@ -752,7 +843,7 @@ def _load_avatar_clips(avatar_id: str, clip_type: str = "idle") -> list[list[np.
                     frames = [_crop_resize_to_fill(f, target_w, target_h) for f in frames]
                 _clip_cache_put(cache_key, frames)
                 cached = frames
-                print(f"[clips] Loaded {clip_path.name}: {len(frames)} frames")
+                logger.info(f"[clips] Loaded {clip_path.name}: {len(frames)} frames")
         if cached is not None:
             result.append(cached)
     return result
@@ -793,7 +884,7 @@ def _generate_video(sdk, avatar_id: str, audio_path: str,
     sdk.close()
     gen_time = time.time() - t1
 
-    print(f"Setup: {setup_time:.3f}s | Generation: {gen_time:.3f}s | Total: {setup_time + gen_time:.3f}s "
+    logger.info(f"Setup: {setup_time:.3f}s | Generation: {gen_time:.3f}s | Total: {setup_time + gen_time:.3f}s "
           f"(timesteps={timesteps}, fps={video_fps})")
 
     # Return raw video directly — skip ffmpeg audio mux since
@@ -820,24 +911,24 @@ def _generate_video_from_text(sdk, avatar_id: str, text: str, voice: str = "tara
     header_skipped = False
     header_buf = bytearray()
 
-    with httpx.Client(timeout=120.0) as client:
-        with client.stream("POST", TTS_URL, json={
-            "text": text,
-            "voice": voice,
-            "temperature": 0.6,
-            "top_p": 0.9,
-            "max_tokens": 8000,
-            "repetition_penalty": 1.1,
-        }) as response:
-            response.raise_for_status()
-            for raw_chunk in response.iter_bytes(chunk_size=4096):
-                if not header_skipped:
-                    header_buf.extend(raw_chunk)
-                    if len(header_buf) >= WAV_HEADER_SIZE:
-                        all_audio_24k.extend(header_buf[WAV_HEADER_SIZE:])
-                        header_skipped = True
-                    continue
-                all_audio_24k.extend(raw_chunk)
+    client = _get_tts_client()
+    with client.stream("POST", TTS_URL, json={
+        "text": text,
+        "voice": voice,
+        "temperature": 0.6,
+        "top_p": 0.9,
+        "max_tokens": 8000,
+        "repetition_penalty": 1.1,
+    }) as response:
+        response.raise_for_status()
+        for raw_chunk in response.iter_bytes(chunk_size=4096):
+            if not header_skipped:
+                header_buf.extend(raw_chunk)
+                if len(header_buf) >= WAV_HEADER_SIZE:
+                    all_audio_24k.extend(header_buf[WAV_HEADER_SIZE:])
+                    header_skipped = True
+                continue
+            all_audio_24k.extend(raw_chunk)
 
     tts_time = time.time() - t0
 
@@ -846,7 +937,7 @@ def _generate_video_from_text(sdk, avatar_id: str, text: str, voice: str = "tara
     audio_16k = resample_poly(audio_24k, up=2, down=3).astype(np.float32)
     audio_duration = len(audio_24k) / TTS_SAMPLE_RATE
     num_f = math.ceil(len(audio_16k) / DITTO_SAMPLE_RATE * DEFAULT_FPS)
-    print(f"[pipeline] TTS: {tts_time:.3f}s for {audio_duration:.1f}s audio")
+    logger.info(f"[pipeline] TTS: {tts_time:.3f}s for {audio_duration:.1f}s audio")
 
     # 3. Save audio for ffmpeg merge
     sf.write(audio_output, audio_24k, TTS_SAMPLE_RATE)
@@ -864,7 +955,7 @@ def _generate_video_from_text(sdk, avatar_id: str, text: str, voice: str = "tara
     sdk.audio2motion_queue.put(aud_feat)
     sdk.close()
     ditto_time = time.time() - t1
-    print(f"[pipeline] Ditto: {ditto_time:.3f}s")
+    logger.info(f"[pipeline] Ditto: {ditto_time:.3f}s")
 
     # 5. Merge video + audio (needed for /generate_from_text since client plays MP4 directly)
     raw_video = tmp_output + ".tmp.mp4"
@@ -876,7 +967,7 @@ def _generate_video_from_text(sdk, avatar_id: str, text: str, voice: str = "tara
         capture_output=True, text=True,
     )
     if ffmpeg_result.returncode != 0:
-        print(f"[pipeline] ffmpeg merge failed: {ffmpeg_result.stderr[:500]}")
+        logger.info(f"[pipeline] ffmpeg merge failed: {ffmpeg_result.stderr[:500]}")
 
     for f_path in [raw_video, audio_output]:
         if os.path.exists(f_path):
@@ -884,15 +975,32 @@ def _generate_video_from_text(sdk, avatar_id: str, text: str, voice: str = "tara
 
     total_time = time.time() - t0
     rtf = total_time / audio_duration if audio_duration > 0 else 0
-    print(f"[pipeline] Total: {total_time:.3f}s (TTS {tts_time:.1f}s + Ditto {ditto_time:.1f}s) RTF: {rtf:.2f}x")
+    logger.info(f"[pipeline] Total: {total_time:.3f}s (TTS {tts_time:.1f}s + Ditto {ditto_time:.1f}s) RTF: {rtf:.2f}x")
 
     with open(final_output, "rb") as f:
         return f.read()
 
+def _validate_config():
+    """Validate critical configuration at startup. Fail fast on misconfiguration."""
+    issues = []
+    if not DITTO_PATH.exists():
+        issues.append(f"DITTO_PATH does not exist: {DITTO_PATH}")
+    if not CACHE_DIR.exists():
+        issues.append(f"AVATAR_CACHE_DIR does not exist: {CACHE_DIR}")
+    if TTS_URL and not TTS_URL.startswith(("http://", "https://")):
+        issues.append(f"TTS_URL is not a valid URL: {TTS_URL}")
+    if issues:
+        for issue in issues:
+            logger.info(f"[config] WARNING: {issue}")
+    else:
+        logger.info("[config] All configuration paths validated.")
+
+
 @app.on_event("startup")
 async def startup():
     """Load model, warm-load cached avatars, detect existing clips."""
-    print("Warming up avatar cache from disk...")
+    _validate_config()
+    logger.info("Warming up avatar cache from disk...")
     _warm_load_all()
 
     # Detect pre-rendered clips for cached avatars and pre-load all types
@@ -907,13 +1015,30 @@ async def startup():
                     loaded = _load_avatar_clips(avatar_id, ct)
                     total_variants += len(loaded)
                     total_frames += sum(len(c) for c in loaded)
-            print(f"  Clips loaded for {avatar_id}: {total_variants} variants, {total_frames} frames")
+            logger.info(f"  Clips loaded for {avatar_id}: {total_variants} variants, {total_frames} frames")
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, load_ditto)
 
     # Warm up offline pipeline (used for both /generate and streaming now)
     await loop.run_in_executor(None, warmup_offline_pipeline)
+
+    # Start session cleanup background task
+    asyncio.create_task(_session_cleanup_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Graceful shutdown: stop all sessions, cancel background jobs, cleanup."""
+    logger.info("[shutdown] Stopping all active sessions...")
+    for sid in list(active_sessions.keys()):
+        try:
+            await _auto_stop_session(sid)
+        except Exception as e:
+            logger.info(f"[shutdown] Error stopping session {sid}: {e}")
+    logger.info("[shutdown] Shutting down prerender executor...")
+    prerender_executor.shutdown(wait=False)
+    logger.info("[shutdown] Cleanup complete.")
 
 
 @app.get("/health")
@@ -929,10 +1054,18 @@ async def health():
 
 
 @app.get("/avatars")
-async def list_avatars():
-    """List all cached avatars with inference and clip readiness."""
+async def list_avatars(limit: int = 50, offset: int = 0):
+    """List cached avatars with pagination. ?limit=50&offset=0"""
+    with avatar_cache_lock:
+        all_ids = list(avatar_cache.keys())
+    total = len(all_ids)
+    page_ids = all_ids[offset:offset + limit]
     avatars = []
-    for avatar_id, info in avatar_cache.items():
+    for avatar_id in page_ids:
+        with avatar_cache_lock:
+            info = avatar_cache.get(avatar_id)
+        if info is None:
+            continue
         avatars.append({
             "avatar_id": avatar_id,
             "frames": len(info.get("x_s_info_lst", [])),
@@ -943,7 +1076,7 @@ async def list_avatars():
             "clips_ready": _clips_ready(avatar_id),
             "prerender_status": prerender_jobs.get(avatar_id, {}).get("status", "none"),
         })
-    return {"avatars": avatars, "total": len(avatars)}
+    return {"avatars": avatars, "total": total, "limit": limit, "offset": offset}
 
 
 @app.delete("/avatars/{avatar_id}")
@@ -1076,7 +1209,7 @@ async def register_avatar(request: RegisterAvatarRequest):
         }
 
     except Exception as e:
-        print(f"[error] Internal error: {e}")
+        logger.error(f"[error] Internal error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -1126,7 +1259,7 @@ async def generate_frames(request: Request):
 
     audio_duration = len(audio_raw) / input_sr
     num_f = math.ceil(len(audio_16k) / 16000 * DEFAULT_FPS)
-    print(f"[generate_frames] avatar={avatar_id}, input_sr={input_sr}, "
+    logger.info(f"[generate_frames] avatar={avatar_id}, input_sr={input_sr}, "
           f"duration={audio_duration:.2f}s, expected_frames={num_f}")
 
     sdk = load_ditto()
@@ -1165,7 +1298,7 @@ async def generate_frames(request: Request):
             yield struct.pack(">I", len(jpeg_bytes)) + jpeg_bytes
             frame_count += 1
 
-        print(f"[generate_frames] Streamed {frame_count} frames for avatar={avatar_id}")
+        logger.info(f"[generate_frames] Streamed {frame_count} frames for avatar={avatar_id}")
 
     return StreamingResponse(frame_generator(), media_type="application/octet-stream")
 
@@ -1182,7 +1315,7 @@ async def generate_from_text(request: TextGenerateRequest):
         video_data = _generate_video_from_text(sdk, request.avatar_id, request.text, request.voice)
         return Response(content=video_data, media_type="video/mp4")
     except Exception as e:
-        print(f"[error] Internal error: {e}")
+        logger.error(f"[error] Internal error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -1219,7 +1352,7 @@ async def generate_video(request: GenerateRequest):
         )
 
     except Exception as e:
-        print(f"[error] Internal error: {e}")
+        logger.error(f"[error] Internal error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -1313,9 +1446,9 @@ async def _unified_publisher(session_id: str, session: dict):
     if _has_idle_clips:
         import random as _random
         _random.shuffle(_idle_playlist)
-        print(f"[publisher] Loaded {len(_idle_playlist)} idle clip variants for {avatar_id}")
+        logger.info(f"[publisher] Loaded {len(_idle_playlist)} idle clip variants for {avatar_id}")
 
-    print(f"[publisher] Started unified publisher for session={session_id} fps={fps} (AVSync + perf_counter)")
+    logger.info(f"[publisher] Started unified publisher for session={session_id} fps={fps} (AVSync + perf_counter)")
 
     try:
         while session_id in active_sessions:
@@ -1353,13 +1486,13 @@ async def _unified_publisher(session_id: str, session: dict):
                 idle_frame_count += 1
                 if idle_frame_count <= 3 or idle_frame_count % 200 == 0:
                     mode = "clip" if _has_idle_clips else "static"
-                    print(f"[publisher] idle frame #{idle_frame_count} ({mode})")
+                    logger.info(f"[publisher] idle frame #{idle_frame_count} ({mode})")
 
             else:
                 # ── SPEECH MODE: precise pacing with AVSync ──
                 _speech_t0_perf = _time.perf_counter()
                 _speech_t0_mono = _time.monotonic()
-                print(f"[publisher] Entering speech mode (AVSync + perf_counter, fps={fps})")
+                logger.info(f"[publisher] Entering speech mode (AVSync + perf_counter, fps={fps})")
 
                 audio_sample_offset = 0
                 speech_frame_count = 0
@@ -1439,7 +1572,7 @@ async def _unified_publisher(session_id: str, session: dict):
                         if speech_frame_count <= 3 or speech_frame_count % 25 == 0:
                             elapsed = _time.monotonic() - _speech_t0_mono
                             push_ms = _push_times[-1] * 1000
-                            print(f"[publisher] frame#{speech_frame_count} t={elapsed:.2f}s "
+                            logger.info(f"[publisher] frame#{speech_frame_count} t={elapsed:.2f}s "
                                   f"push={push_ms:.1f}ms")
 
                     # Flush remaining audio with last frame held (skip if interrupted)
@@ -1469,10 +1602,10 @@ async def _unified_publisher(session_id: str, session: dict):
 
                         await audio_source.wait_for_playout()
                     else:
-                        print(f"[publisher] Interrupted — skipped audio flush and playout wait")
+                        logger.info(f"[publisher] Interrupted — skipped audio flush and playout wait")
 
                 except Exception as e:
-                    print(f"[publisher] Speech error: {e}")
+                    logger.info(f"[publisher] Speech error: {e}")
                     import traceback; traceback.print_exc()
 
                 _speech_dur = _time.monotonic() - _speech_t0_mono
@@ -1483,30 +1616,30 @@ async def _unified_publisher(session_id: str, session: dict):
                 video_dur = speech_frame_count / fps if fps > 0 else 0
                 ratio = video_dur / audio_dur if audio_dur > 0 else 0
 
-                print(f"\n{'='*60}")
-                print(f"  PUBLISHER TIMING REPORT")
-                print(f"{'='*60}")
-                print(f"  Pipeline frames:    {speech_frame_count}")
-                print(f"  Expected @{fps}fps:  {expected_frames} frames")
-                print(f"  Audio duration:     {audio_dur:.2f}s")
-                print(f"  Video duration:     {video_dur:.2f}s (@{fps}fps)")
-                print(f"  V/A ratio:          {ratio:.3f}x {'OK' if 0.95 < ratio < 1.05 else 'MISMATCH!'}")
-                print(f"  Wall-clock:         {_speech_dur:.2f}s")
-                print(f"  Audio delay:        {AUDIO_DELAY_FRAMES} frames ({AUDIO_DELAY_FRAMES * 1000 / fps:.0f}ms)")
-                print(f"  Audio pushed:       {audio_sample_offset} / {total_audio} samples")
+                logger.info(f"\n{'='*60}")
+                logger.info(f"  PUBLISHER TIMING REPORT")
+                logger.info(f"{'='*60}")
+                logger.info(f"  Pipeline frames:    {speech_frame_count}")
+                logger.info(f"  Expected @{fps}fps:  {expected_frames} frames")
+                logger.info(f"  Audio duration:     {audio_dur:.2f}s")
+                logger.info(f"  Video duration:     {video_dur:.2f}s (@{fps}fps)")
+                logger.info(f"  V/A ratio:          {ratio:.3f}x {'OK' if 0.95 < ratio < 1.05 else 'MISMATCH!'}")
+                logger.info(f"  Wall-clock:         {_speech_dur:.2f}s")
+                logger.info(f"  Audio delay:        {AUDIO_DELAY_FRAMES} frames ({AUDIO_DELAY_FRAMES * 1000 / fps:.0f}ms)")
+                logger.info(f"  Audio pushed:       {audio_sample_offset} / {total_audio} samples")
                 if _push_times:
-                    print(f"  AVSync push time:   min={min(_push_times)*1000:.1f}ms "
+                    logger.info(f"  AVSync push time:   min={min(_push_times)*1000:.1f}ms "
                           f"avg={sum(_push_times)/len(_push_times)*1000:.1f}ms "
                           f"max={max(_push_times)*1000:.1f}ms")
                 if len(_frame_arrive_times) > 1:
                     gaps = [_frame_arrive_times[i+1] - _frame_arrive_times[i]
                             for i in range(len(_frame_arrive_times) - 1)]
                     burst = sum(1 for g in gaps if g < 0.005)
-                    print(f"  Frame arrival gaps: min={min(gaps)*1000:.1f}ms "
+                    logger.info(f"  Frame arrival gaps: min={min(gaps)*1000:.1f}ms "
                           f"avg={sum(gaps)/len(gaps)*1000:.1f}ms "
                           f"max={max(gaps)*1000:.1f}ms  "
                           f"burst(<5ms)={burst}/{len(gaps)}")
-                print(f"{'='*60}\n")
+                logger.info(f"{'='*60}\n")
 
                 # Return to idle — reset idle timer so pacing restarts cleanly
                 session["output_queue"] = None
@@ -1514,9 +1647,9 @@ async def _unified_publisher(session_id: str, session: dict):
                 idle_frame_count = 0
 
     except asyncio.CancelledError:
-        print(f"[publisher] Cancelled (idle={idle_frame_count}, speech={speech_frame_count})")
+        logger.info(f"[publisher] Cancelled (idle={idle_frame_count}, speech={speech_frame_count})")
     except Exception as e:
-        print(f"[publisher] ERROR: {e}")
+        logger.info(f"[publisher] ERROR: {e}")
         import traceback; traceback.print_exc()
 
 
@@ -1545,6 +1678,7 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
     room: lk_rtc.Room = session["room"]
     sdk = load_ditto()  # Use OFFLINE SDK — proven correct speed
     audio_accum = bytearray()
+    MAX_AUDIO_SEGMENT_BYTES = 50 * 1024 * 1024  # 50MB max per segment (~9 min at 24kHz 16-bit)
     pipeline_active = False
 
     # Shared state for interrupt handling
@@ -1553,26 +1687,6 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
 
     # Channel for incoming ByteStreamReaders
     reader_queue: asyncio.Queue[lk_rtc.ByteStreamReader] = asyncio.Queue()
-
-    def _to_mono_int16(pcm: np.ndarray, num_channels: int) -> np.ndarray:
-        """Convert interleaved PCM int16 to mono int16."""
-        if num_channels <= 1:
-            return pcm
-        usable = (len(pcm) // num_channels) * num_channels
-        if usable <= 0:
-            return np.zeros((0,), dtype=np.int16)
-        pcm = pcm[:usable].reshape(-1, num_channels).astype(np.int32)
-        return np.mean(pcm, axis=1).clip(-32768, 32767).astype(np.int16)
-
-    def _resample_int16(pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-        """Resample PCM int16 using polyphase filtering."""
-        if src_sr == dst_sr or len(pcm) == 0:
-            return pcm
-        g = math.gcd(src_sr, dst_sr)
-        up = dst_sr // g
-        down = src_sr // g
-        out = resample_poly(pcm.astype(np.float64), up, down)
-        return np.round(out).clip(-32768, 32767).astype(np.int16)
 
     def _parse_int_attr(attrs: dict, key: str, default: int) -> int:
         val = attrs.get(key, default)
@@ -1603,7 +1717,7 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
     room.register_byte_stream_handler(AUDIO_STREAM_TOPIC, _on_byte_stream)
     room.local_participant.register_rpc_method(RPC_CLEAR_BUFFER, _on_clear_buffer)
 
-    print(f"[datastream] Audio receiver started for session={session_id}, agent={agent_identity}")
+    logger.info(f"[datastream] Audio receiver started for session={session_id}, agent={agent_identity}")
 
     try:
         while session_id in active_sessions:
@@ -1628,7 +1742,7 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
                 _parse_int_attr(attrs, "channels", 1),
             )
 
-            print(
+            logger.info(
                 f"[datastream] New audio stream: sample_rate={sender_sr}, "
                 f"channels={sender_channels}"
             )
@@ -1651,13 +1765,16 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
                     total_bytes += len(data)
 
                     # Buffer raw bytes for batch resampling at segment end
+                    if len(audio_accum) + len(data) > MAX_AUDIO_SEGMENT_BYTES:
+                        logger.info(f"[datastream] WARNING: Audio segment exceeded {MAX_AUDIO_SEGMENT_BYTES // 1024 // 1024}MB limit, truncating")
+                        break
                     audio_accum.extend(data)
             except Exception as e:
-                print(f"[datastream] Error reading stream: {e}")
+                logger.info(f"[datastream] Error reading stream: {e}")
 
             if current_reader_cleared:
                 # Handle interruption — no pipeline to tear down since we haven't started one
-                print(f"[datastream] Interrupted after {total_bytes} bytes")
+                logger.info(f"[datastream] Interrupted after {total_bytes} bytes")
                 audio_accum.clear()
                 session["audio_24k_chunks"] = []
                 session["audio_24k_buffer"] = None
@@ -1674,7 +1791,7 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
                         }),
                     )
                 except Exception as e:
-                    print(f"[datastream] Failed to send playback_finished RPC: {e}")
+                    logger.info(f"[datastream] Failed to send playback_finished RPC: {e}")
                 continue
 
             # ── End of segment: normalize to 24k mono, then batch-process ──
@@ -1698,7 +1815,7 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
             session["audio_24k_dirty"] = False
 
             num_f = math.ceil(len(audio_16k) / 16000 * DEFAULT_FPS)
-            print(
+            logger.info(
                 f"[datastream] Segment end: {total_bytes} bytes -> "
                 f"{len(audio_24k_pcm)} samples @24k ({audio_duration:.2f}s), "
                 f"expected {num_f} frames"
@@ -1727,7 +1844,7 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
             aud_feat = await loop.run_in_executor(
                 None, lambda: sdk.wav2feat.wav2feat(audio_16k, sr=16000),
             )
-            print(f"[datastream] Offline wav2feat: {len(aud_feat)} features for {audio_duration:.2f}s audio "
+            logger.info(f"[datastream] Offline wav2feat: {len(aud_feat)} features for {audio_duration:.2f}s audio "
                   f"(expected {num_f}, wav2feat_hardcoded_25fps={int(len(audio_16k)/16000*25)})")
 
             sdk.audio2motion_queue.put(aud_feat)
@@ -1739,7 +1856,7 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
             try:
                 await asyncio.wait_for(speech_done_event.wait(), timeout=max(audio_duration * 3, 60))
             except asyncio.TimeoutError:
-                print(f"[datastream] WARNING: speech_done timeout after {audio_duration*3:.0f}s")
+                logger.info(f"[datastream] WARNING: speech_done timeout after {audio_duration*3:.0f}s")
 
             was_interrupted = session.get("_speech_interrupted", False)
             playback_duration = session.get("audio_24k_total_samples", 0) / 24000.0
@@ -1762,14 +1879,14 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
                     }),
                 )
                 if was_interrupted:
-                    print(f"[datastream] Playback interrupted — sent playback_finished(interrupted=True)")
+                    logger.info(f"[datastream] Playback interrupted — sent playback_finished(interrupted=True)")
             except Exception as e:
-                print(f"[datastream] Failed to send playback_finished RPC: {e}")
+                logger.info(f"[datastream] Failed to send playback_finished RPC: {e}")
 
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print(f"[datastream] Audio receiver error: {e}")
+        logger.info(f"[datastream] Audio receiver error: {e}")
         import traceback; traceback.print_exc()
     finally:
         # Clean up pipeline if still active
@@ -1780,7 +1897,7 @@ async def _audio_receiver_task(session_id: str, session: dict, agent_identity: s
             except Exception:
                 pass
             session["output_queue"] = None
-        print(f"[datastream] Audio receiver stopped for session={session_id}")
+        logger.info(f"[datastream] Audio receiver stopped for session={session_id}")
 
 
 @app.post("/start_session")
@@ -1801,10 +1918,21 @@ async def start_session(request: StartSessionRequest):
     session_id = str(uuid.uuid4())[:8]
 
     try:
-        # Connect to LiveKit room as avatar participant
+        # Connect to LiveKit room with retry on transient failures
         room = lk_rtc.Room()
-        await room.connect(request.livekit_url, request.livekit_token)
-        print(f"[stream] Session {session_id}: connected to LiveKit room '{room.name}', avatar={request.avatar_id}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await room.connect(request.livekit_url, request.livekit_token)
+                break
+            except Exception as conn_err:
+                if attempt < max_retries - 1:
+                    wait_s = 2 ** attempt  # exponential backoff: 1s, 2s
+                    logger.info(f"[stream] LiveKit connect attempt {attempt + 1} failed: {conn_err}, retrying in {wait_s}s...")
+                    await asyncio.sleep(wait_s)
+                else:
+                    raise
+        logger.info(f"[stream] Session {session_id}: connected to LiveKit room '{room.name}', avatar={request.avatar_id}")
 
         # Create video source matching the registered avatar's resolution.
         # With max_dim=512 registration, the avatar is ~512x340 or similar.
@@ -1827,7 +1955,7 @@ async def start_session(request: StartSessionRequest):
             ),
         )
         await room.local_participant.publish_track(video_track, video_opts)
-        print(f"[stream] Session {session_id}: video track published")
+        logger.info(f"[stream] Session {session_id}: video track published")
 
         # Create audio source and publish track (24kHz mono — matches TTS output)
         audio_source = lk_rtc.AudioSource(sample_rate=24000, num_channels=1, queue_size_ms=100)
@@ -1836,7 +1964,7 @@ async def start_session(request: StartSessionRequest):
         )
         audio_opts = lk_rtc.TrackPublishOptions(source=lk_rtc.TrackSource.SOURCE_MICROPHONE)
         await room.local_participant.publish_track(audio_track, audio_opts)
-        print(f"[stream] Session {session_id}: audio track published")
+        logger.info(f"[stream] Session {session_id}: audio track published")
 
         # Create AVSynchronizer — Rust FFI handles FPS pacing + RTP timestamps
         av_sync = lk_rtc.AVSynchronizer(
@@ -1870,6 +1998,7 @@ async def start_session(request: StartSessionRequest):
                 "_total_frames_published": 0,
                 "_speech_done_event": asyncio.Event(),
                 "_speech_interrupted": False,
+                "_created_at": time.time(),
             }
 
         # Auto-stop session when agent or room disconnects (handles crashes/abrupt drops)
@@ -1880,20 +2009,20 @@ async def start_session(request: StartSessionRequest):
             if session_id not in active_sessions:
                 return
             if participant.identity == agent_identity_for_disconnect:
-                print(f"[stream] Agent {participant.identity} disconnected — auto-stopping session {session_id}")
+                logger.info(f"[stream] Agent {participant.identity} disconnected — auto-stopping session {session_id}")
                 asyncio.create_task(_auto_stop_session(session_id))
 
         @room.on("disconnected")
         def _on_room_disconnected(*args):
             if session_id in active_sessions:
-                print(f"[stream] Room disconnected — auto-stopping session {session_id}")
+                logger.info(f"[stream] Room disconnected — auto-stopping session {session_id}")
                 asyncio.create_task(_auto_stop_session(session_id))
 
         publisher_task = asyncio.create_task(
             _unified_publisher(session_id, active_sessions[session_id])
         )
         active_sessions[session_id]["publisher_task"] = publisher_task
-        print(f"[stream] Session {session_id}: unified publisher started")
+        logger.info(f"[stream] Session {session_id}: unified publisher started")
 
         # Start DataStream audio receiver if agent identity provided
         if request.agent_identity:
@@ -1901,7 +2030,7 @@ async def start_session(request: StartSessionRequest):
                 _audio_receiver_task(session_id, active_sessions[session_id], request.agent_identity)
             )
             active_sessions[session_id]["audio_recv_task"] = audio_recv_task
-            print(f"[stream] Session {session_id}: DataStream audio receiver started (agent={request.agent_identity})")
+            logger.info(f"[stream] Session {session_id}: DataStream audio receiver started (agent={request.agent_identity})")
 
         return {
             "session_id": session_id,
@@ -1911,9 +2040,12 @@ async def start_session(request: StartSessionRequest):
         }
 
     except Exception as e:
-        print(f"[stream] Failed to start session: {e}")
-        print(f"[error] Failed to connect to LiveKit room: {e}")
+        logger.info(f"[stream] Failed to start session: {e}")
+        logger.error(f"[error] Failed to connect to LiveKit room: {e}")
         raise HTTPException(status_code=500, detail="Failed to connect to LiveKit room")
+
+
+SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "1800"))  # 30 min default
 
 
 async def _auto_stop_session(session_id: str):
@@ -1930,9 +2062,22 @@ async def _auto_stop_session(session_id: str):
         if session.get("av_sync"):
             await session["av_sync"].aclose()
         await session["room"].disconnect()
-        print(f"[stream] Session {session_id}: auto-stopped and room disconnected")
+        logger.info(f"[stream] Session {session_id}: auto-stopped and room disconnected")
     except Exception as e:
-        print(f"[stream] Error in auto-stop for session {session_id}: {e}")
+        logger.info(f"[stream] Error in auto-stop for session {session_id}: {e}")
+
+
+async def _session_cleanup_loop():
+    """Periodically check for stale sessions and clean them up."""
+    while True:
+        await asyncio.sleep(60)  # check every minute
+        now = time.time()
+        with active_sessions_lock:
+            stale = [sid for sid, s in active_sessions.items()
+                     if now - s.get("_created_at", now) > SESSION_TTL_SECONDS]
+        for sid in stale:
+            logger.info(f"[cleanup] Session {sid} exceeded TTL ({SESSION_TTL_SECONDS}s), auto-stopping")
+            await _auto_stop_session(sid)
 
 
 @app.post("/stop_session/{session_id}")
@@ -2017,7 +2162,7 @@ async def ws_test_frames(ws: WebSocket, avatar_id: str = "imogen", duration: flo
     aud_feat = await loop.run_in_executor(
         None, lambda: sdk.wav2feat.wav2feat(audio_16k, sr=16000),
     )
-    print(f"[test_frames] {len(aud_feat)} features for {duration}s audio, expecting {num_f} frames")
+    logger.info(f"[test_frames] {len(aud_feat)} features for {duration}s audio, expecting {num_f} frames")
     sdk.audio2motion_queue.put(aud_feat)
 
     # Drain frames in background
@@ -2048,7 +2193,7 @@ async def ws_test_frames(ws: WebSocket, avatar_id: str = "imogen", duration: flo
         "expected": num_f,
     }))
 
-    print(f"[test_frames] Sent {frame_count} frames to browser")
+    logger.info(f"[test_frames] Sent {frame_count} frames to browser")
     await ws.close()
 
 
