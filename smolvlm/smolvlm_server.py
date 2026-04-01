@@ -4,6 +4,7 @@ Port: 8002
 HuggingFace SmolVLM for image understanding
 """
 import asyncio
+import os
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -65,7 +66,9 @@ async def query_image(request: ImageQueryRequest):
         import torch
         
         model, processor = get_model()
-        
+        if model is None or processor is None:
+            raise HTTPException(status_code=503, detail="Model not loaded")
+
         # Get image
         MAX_BASE64_SIZE = 50 * 1024 * 1024  # 50MB
         if request.image_base64:
@@ -141,7 +144,9 @@ async def query_image_upload(
         import torch
         
         model, processor = get_model()
-        
+        if model is None or processor is None:
+            raise HTTPException(status_code=503, detail="Model not loaded")
+
         # Read image
         image_data = await image.read()
         pil_image = process_image(image_data)

@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field, ValidationError
 # ─── Re-implement CircuitBreaker for testing ───────────────────────
 
 class CircuitBreaker:
-    def __init__(self, name, failure_threshold=3, cooldown_seconds=30):
+    def __init__(self, name: str, failure_threshold: int = 3, cooldown_seconds: float = 30):
         self.name = name
         self.failure_threshold = failure_threshold
         self.cooldown_seconds = cooldown_seconds
@@ -49,16 +49,16 @@ class GenerateRequest(BaseModel):
     avatar_id: str
     audio_base64: str | None = None
     audio_path: str | None = None
-    sampling_timesteps: int | None = Field(None, ge=1, le=50)
-    fps: int | None = Field(None, ge=1, le=60)
+    sampling_timesteps: int | None = Field(default=None, ge=1, le=50)
+    fps: int | None = Field(default=None, ge=1, le=60)
 
 
 class StartSessionRequest(BaseModel):
     avatar_id: str
     livekit_url: str
     livekit_token: str
-    fps: int = Field(25, ge=1, le=60)
-    sampling_timesteps: int = Field(5, ge=1, le=50)
+    fps: int = Field(default=25, ge=1, le=60)
+    sampling_timesteps: int = Field(default=5, ge=1, le=50)
     agent_identity: str | None = None
 
 

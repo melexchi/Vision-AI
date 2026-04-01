@@ -24,3 +24,5 @@ __pycache__/
 
 # Logs
 *.log
+.claude/settings.local.json
+demo_data/

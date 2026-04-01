@@ -67,6 +67,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ─── Prometheus Metrics ────────────────────────────────────────────
 if PROMETHEUS_AVAILABLE:
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
     REQUEST_COUNT = Counter("ditto_requests_total", "Total requests", ["method", "endpoint", "status"])
     REQUEST_LATENCY = Histogram("ditto_request_latency_seconds", "Request latency", ["method", "endpoint"])
     ACTIVE_SESSIONS_GAUGE = Gauge("ditto_active_sessions", "Active LiveKit sessions")
@@ -401,6 +402,9 @@ def _resolve_backend(backend: str) -> tuple[str, str]:
             # Fall back to v10 config (warp_network.pth) if no TRT warp engine
             elif (ckpt / "ditto_cfg" / "v0.4_hubert_cfg_trt_v10.pkl").exists():
                 return "v0.4_hubert_cfg_trt_v10.pkl", "ditto_trt_Ampere_Plus"
+            else:
+                logger.warning("DITTO_BACKEND=trt but no matching config found, falling back to pytorch")
+                return "v0.4_hubert_cfg_pytorch.pkl", "ditto_pytorch"
         else:
             logger.warning(f" DITTO_BACKEND=trt but no TRT engines found, falling back to pytorch")
             return "v0.4_hubert_cfg_pytorch.pkl", "ditto_pytorch"
@@ -982,7 +986,7 @@ def _load_avatar_clips(avatar_id: str, clip_type: str = "idle") -> list[list[np.
 
 
 def _generate_video(sdk, avatar_id: str, audio_path: str,
-                    sampling_timesteps: int = None, fps: int = None) -> bytes:
+                    sampling_timesteps: int | None = None, fps: int | None = None) -> bytes:
     """Generate video using cached avatar."""
     if avatar_id not in avatar_cache:
         raise ValueError(f"Avatar {avatar_id} not found in cache")

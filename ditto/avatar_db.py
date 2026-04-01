@@ -82,7 +82,7 @@ class AvatarDB:
             conn.close()
             return dict(row) if row else None
 
-    def list_all(self, limit: int = 50, offset: int = 0) -> list[dict]:
+    def list_all(self, limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
         """List avatar metadata with pagination."""
         with self._lock:
             conn = self._get_conn()
