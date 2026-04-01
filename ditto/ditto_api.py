@@ -38,7 +38,7 @@ DITTO_PATH = Path(os.environ.get("DITTO_PATH", str(Path(__file__).resolve().pare
 sys.path.insert(0, str(DITTO_PATH))
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import StreamingResponse, Response, FileResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, Response, FileResponse, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
@@ -50,13 +50,52 @@ import soundfile as sf
 from scipy.signal import resample_poly
 
 try:
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+try:
     from livekit import rtc as lk_rtc, api as lk_api
     LIVEKIT_AVAILABLE = True
 except ImportError:
     LIVEKIT_AVAILABLE = False
 
-app = FastAPI(title="Ditto Avatar API", version="2.0")
+app = FastAPI(title="Ditto Avatar API", version="2.0", docs_url="/docs", redoc_url="/redoc")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+# ─── Prometheus Metrics ────────────────────────────────────────────
+if PROMETHEUS_AVAILABLE:
+    REQUEST_COUNT = Counter("ditto_requests_total", "Total requests", ["method", "endpoint", "status"])
+    REQUEST_LATENCY = Histogram("ditto_request_latency_seconds", "Request latency", ["method", "endpoint"])
+    ACTIVE_SESSIONS_GAUGE = Gauge("ditto_active_sessions", "Active LiveKit sessions")
+    AVATAR_CACHE_SIZE = Gauge("ditto_avatar_cache_size", "Avatars in memory cache")
+
+    @app.middleware("http")
+    async def prometheus_middleware(request: Request, call_next):
+        start = time.time()
+        response = await call_next(request)
+        elapsed = time.time() - start
+        endpoint = request.url.path
+        REQUEST_COUNT.labels(request.method, endpoint, response.status_code).inc()
+        REQUEST_LATENCY.labels(request.method, endpoint).observe(elapsed)
+        ACTIVE_SESSIONS_GAUGE.set(len(active_sessions))
+        AVATAR_CACHE_SIZE.set(len(avatar_cache))
+        return response
+
+    @app.get("/metrics")
+    async def metrics():
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    """Consistent error response format with error code."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "code": f"ERR_{exc.status_code}"},
+    )
 
 # Simple in-memory rate limiter (per-IP, token bucket)
 _rate_limit_buckets: dict[str, list] = {}  # ip -> [timestamp, ...]
@@ -81,12 +120,18 @@ async def rate_limit_middleware(request: Request, call_next):
 ditto_sdk = None
 avatar_cache: dict[str, dict] = {}  # avatar_id -> source_info
 avatar_cache_lock = threading.Lock()
+_avatar_cache_order: list[str] = []  # LRU order: most-recently-used at end
+MAX_CACHED_AVATARS = int(os.environ.get("MAX_CACHED_AVATARS", "50"))
 active_sessions: dict[str, dict] = {}  # session_id -> {room, video_source, output_queue, ...}
 active_sessions_lock = threading.Lock()
 
 
 CACHE_DIR = Path(os.environ.get("AVATAR_CACHE_DIR", "/workspace/avatar_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# SQLite metadata store (persistent across restarts)
+from avatar_db import AvatarDB
+avatar_db = AvatarDB(CACHE_DIR / "avatars.db")
 
 CLIPS_DIR = Path(os.environ.get("AVATAR_CLIPS_DIR", "/workspace/avatar_clips"))
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -196,6 +241,39 @@ class StartSessionRequest(BaseModel):
     agent_identity: str | None = None  # Identity of the agent sending audio via DataStream
 
 
+# ─── Response Models (for OpenAPI documentation) ──────────────────
+
+class HealthResponse(BaseModel):
+    status: str = "ok"
+    model: str = "ditto"
+    cached_avatars: int = 0
+    avatar_ids: list[str] = []
+
+class RegisterResponse(BaseModel):
+    status: str = "registered"
+    avatar_id: str
+    inference_ready: bool = True
+    clips_ready: dict = {}
+    prerender_status: str = "none"
+    size_mb: float = 0.0
+
+class AvatarListResponse(BaseModel):
+    avatars: list[dict] = []
+    total: int = 0
+    limit: int = 50
+    offset: int = 0
+
+class SessionResponse(BaseModel):
+    session_id: str
+    status: str
+    avatar_id: str
+    room: str = ""
+
+class ErrorResponse(BaseModel):
+    detail: str
+    code: str = "ERR_500"
+
+
 MAX_BASE64_SIZE = 50 * 1024 * 1024  # 50MB max for base64 uploads
 
 # Allowed parent directories for user-supplied file paths
@@ -302,7 +380,7 @@ def _warm_load_all():
             with open(pkl_file, "rb") as f:
                 data = pickle.load(f)
             with avatar_cache_lock:
-                avatar_cache[avatar_id] = data
+                _avatar_cache_put(avatar_id, data)
             logger.info(f"  Loaded cached avatar: {avatar_id}")
         except Exception as e:
             logger.info(f"  Failed to load cache {pkl_file}: {e}")
@@ -499,6 +577,41 @@ class _QueueWriter:
         self._queue.put(None)
 
 
+class CircuitBreaker:
+    """Simple circuit breaker: opens after N failures, auto-resets after cooldown_seconds."""
+
+    def __init__(self, name: str, failure_threshold: int = 3, cooldown_seconds: float = 30):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self._failures = 0
+        self._last_failure_time = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            if self._failures >= self.failure_threshold:
+                if time.time() - self._last_failure_time > self.cooldown_seconds:
+                    self._failures = 0  # auto-reset after cooldown
+                    return False
+                return True
+            return False
+
+    def record_failure(self):
+        with self._lock:
+            self._failures += 1
+            self._last_failure_time = time.time()
+            logger.warning(f"[circuit-breaker] {self.name}: failure {self._failures}/{self.failure_threshold}")
+
+    def record_success(self):
+        with self._lock:
+            self._failures = 0
+
+
+_tts_circuit = CircuitBreaker("tts", failure_threshold=3, cooldown_seconds=30)
+_prerender_circuit = CircuitBreaker("prerender", failure_threshold=2, cooldown_seconds=60)
+
 _ditto_load_lock = threading.Lock()
 
 
@@ -583,7 +696,7 @@ def _register_avatar(sdk, image_path: str, avatar_id: str | None = None) -> tupl
     cached = _load_cache(avatar_id)
     if cached is not None:
         with avatar_cache_lock:
-            avatar_cache[avatar_id] = cached
+            _avatar_cache_put(avatar_id, cached)
         logger.info(f"Avatar {avatar_id} loaded from disk cache")
         return avatar_id, cached
 
@@ -596,7 +709,7 @@ def _register_avatar(sdk, image_path: str, avatar_id: str | None = None) -> tupl
 
     # Cache in memory + disk
     with avatar_cache_lock:
-        avatar_cache[avatar_id] = source_info
+        _avatar_cache_put(avatar_id, source_info)
     _save_cache(avatar_id, source_info)
 
     # Persist source image for background pre-render
@@ -604,7 +717,8 @@ def _register_avatar(sdk, image_path: str, avatar_id: str | None = None) -> tupl
     if not persistent_img.exists():
         shutil.copy2(image_path, persistent_img)
 
-    logger.info(f"Avatar {avatar_id} cached (memory + disk, ~{_estimate_size_mb(source_info):.1f} MB)")
+    avatar_db.upsert(avatar_id, image_path=str(image_path), size_mb=round(_estimate_size_mb(source_info), 1))
+    logger.info(f"Avatar {avatar_id} cached (memory + disk + db, ~{_estimate_size_mb(source_info):.1f} MB)")
 
     return avatar_id, source_info
 
@@ -704,6 +818,7 @@ def _run_prerender(avatar_id: str, image_path: str):
             with prerender_jobs_lock:
                 prerender_jobs[avatar_id] = {"status": "done", "finished": time.time()}
             logger.info(f"[prerender] Clips ready for {avatar_id}")
+            _prerender_circuit.record_success()
         else:
             with prerender_jobs_lock:
                 prerender_jobs[avatar_id] = {
@@ -711,6 +826,7 @@ def _run_prerender(avatar_id: str, image_path: str):
                     "error": result.stderr[-1000:] if result.stderr else "unknown error",
                 }
             logger.info(f"[prerender] Failed for {avatar_id}:\n{result.stderr}")
+            _prerender_circuit.record_failure()
 
     except subprocess.TimeoutExpired:
         with prerender_jobs_lock:
@@ -724,6 +840,9 @@ def _run_prerender(avatar_id: str, image_path: str):
 
 def _start_prerender(avatar_id: str, image_path: str):
     """Submit a pre-render job to the background executor."""
+    if _prerender_circuit.is_open:
+        logger.warning(f"[prerender] Circuit breaker open, skipping prerender for {avatar_id}")
+        return
     with prerender_jobs_lock:
         if avatar_id in prerender_jobs and prerender_jobs[avatar_id]["status"] in ("running", "done"):
             return  # already running or finished
@@ -755,6 +874,19 @@ def _estimate_size_mb(source_info: dict) -> float:
 _CLIP_CACHE_MAX = int(os.environ.get("CLIP_CACHE_MAX", "20"))
 _clip_frame_cache: dict[str, list[np.ndarray]] = {}
 _clip_cache_order: list[str] = []  # LRU order: most-recently-used at end
+
+
+def _avatar_cache_put(avatar_id: str, source_info: dict):
+    """Insert into avatar cache with LRU eviction. Caller must hold avatar_cache_lock."""
+    if avatar_id in avatar_cache:
+        if avatar_id in _avatar_cache_order:
+            _avatar_cache_order.remove(avatar_id)
+    avatar_cache[avatar_id] = source_info
+    _avatar_cache_order.append(avatar_id)
+    while len(_avatar_cache_order) > MAX_CACHED_AVATARS:
+        evict_id = _avatar_cache_order.pop(0)
+        avatar_cache.pop(evict_id, None)
+        logger.info(f"[cache] Evicted avatar {evict_id} from memory (LRU, max={MAX_CACHED_AVATARS})")
 
 
 def _clip_cache_put(key: str, frames: list[np.ndarray]):
@@ -895,6 +1027,8 @@ def _generate_video(sdk, avatar_id: str, audio_path: str,
 
 def _generate_video_from_text(sdk, avatar_id: str, text: str, voice: str = "tara") -> bytes:
     """Generate video from text - streams TTS then processes through Ditto."""
+    if _tts_circuit.is_open:
+        raise RuntimeError("TTS service circuit breaker is open — too many recent failures")
     if avatar_id not in avatar_cache:
         raise ValueError(f"Avatar {avatar_id} not found in cache")
 
@@ -911,24 +1045,29 @@ def _generate_video_from_text(sdk, avatar_id: str, text: str, voice: str = "tara
     header_skipped = False
     header_buf = bytearray()
 
-    client = _get_tts_client()
-    with client.stream("POST", TTS_URL, json={
-        "text": text,
-        "voice": voice,
-        "temperature": 0.6,
-        "top_p": 0.9,
-        "max_tokens": 8000,
-        "repetition_penalty": 1.1,
-    }) as response:
-        response.raise_for_status()
-        for raw_chunk in response.iter_bytes(chunk_size=4096):
-            if not header_skipped:
-                header_buf.extend(raw_chunk)
-                if len(header_buf) >= WAV_HEADER_SIZE:
-                    all_audio_24k.extend(header_buf[WAV_HEADER_SIZE:])
-                    header_skipped = True
-                continue
-            all_audio_24k.extend(raw_chunk)
+    try:
+        client = _get_tts_client()
+        with client.stream("POST", TTS_URL, json={
+            "text": text,
+            "voice": voice,
+            "temperature": 0.6,
+            "top_p": 0.9,
+            "max_tokens": 8000,
+            "repetition_penalty": 1.1,
+        }) as response:
+            response.raise_for_status()
+            for raw_chunk in response.iter_bytes(chunk_size=4096):
+                if not header_skipped:
+                    header_buf.extend(raw_chunk)
+                    if len(header_buf) >= WAV_HEADER_SIZE:
+                        all_audio_24k.extend(header_buf[WAV_HEADER_SIZE:])
+                        header_skipped = True
+                    continue
+                all_audio_24k.extend(raw_chunk)
+        _tts_circuit.record_success()
+    except Exception as tts_err:
+        _tts_circuit.record_failure()
+        raise RuntimeError(f"TTS request failed: {tts_err}") from tts_err
 
     tts_time = time.time() - t0
 
@@ -1041,7 +1180,7 @@ async def shutdown():
     logger.info("[shutdown] Cleanup complete.")
 
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health():
     return {
         "status": "ok",
@@ -1053,7 +1192,7 @@ async def health():
     }
 
 
-@app.get("/avatars")
+@app.get("/avatars", response_model=AvatarListResponse)
 async def list_avatars(limit: int = 50, offset: int = 0):
     """List cached avatars with pagination. ?limit=50&offset=0"""
     with avatar_cache_lock:
@@ -1112,6 +1251,8 @@ async def delete_avatar(avatar_id: str):
 
     with prerender_jobs_lock:
         prerender_jobs.pop(avatar_id, None)
+
+    avatar_db.delete(avatar_id)
 
     if not removed_memory and not removed_disk:
         raise HTTPException(status_code=404, detail=f"Avatar {avatar_id} not found")
@@ -2068,16 +2209,26 @@ async def _auto_stop_session(session_id: str):
 
 
 async def _session_cleanup_loop():
-    """Periodically check for stale sessions and clean them up."""
+    """Periodically check for stale sessions and expired prerender jobs."""
     while True:
         await asyncio.sleep(60)  # check every minute
         now = time.time()
+        # Clean up stale sessions
         with active_sessions_lock:
             stale = [sid for sid, s in active_sessions.items()
                      if now - s.get("_created_at", now) > SESSION_TTL_SECONDS]
         for sid in stale:
             logger.info(f"[cleanup] Session {sid} exceeded TTL ({SESSION_TTL_SECONDS}s), auto-stopping")
             await _auto_stop_session(sid)
+        # Clean up completed/failed prerender jobs older than 1 hour
+        with prerender_jobs_lock:
+            expired = [aid for aid, job in prerender_jobs.items()
+                       if job.get("status") in ("done", "failed")
+                       and now - job.get("finished", job.get("started", now)) > 3600]
+            for aid in expired:
+                prerender_jobs.pop(aid, None)
+        if expired:
+            logger.info(f"[cleanup] Purged {len(expired)} expired prerender jobs")
 
 
 @app.post("/stop_session/{session_id}")

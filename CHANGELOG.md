@@ -59,6 +59,16 @@ Format: [DATE] [AUTHOR] Description
 - **BUG-036** Audio backpressure: 50MB max segment size limit on LiveKit DataStream
 - **BUG-037** Subprocess errors: full stderr in logs, 1000-char storage (was 300)
 
+### Added (Features)
+
+- **FEAT-004** Avatar cache LRU eviction (`MAX_CACHED_AVATARS`, default 50) + prerender job cleanup (1hr expiry)
+- **FEAT-008** CircuitBreaker class for TTS and prerender calls (auto-open after N failures, cooldown reset)
+- **FEAT-009** Consistent error format: all errors return `{"detail": "...", "code": "ERR_xxx"}`
+- **FEAT-010** Prometheus metrics: `/metrics` endpoint with request count, latency histograms, active session gauge
+- **FEAT-011** OpenAPI response models (HealthResponse, RegisterResponse, AvatarListResponse, SessionResponse, ErrorResponse)
+- **FEAT-012** SQLite metadata store (`ditto/avatar_db.py`) for persistent avatar + session tracking
+- 23 automated tests: SQLite CRUD, thread safety, input validation, circuit breaker, LRU cache, SSRF protection
+
 ### Removed
 
 - `streaming_sdk` deprecated global variable
