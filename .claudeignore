@@ -1,0 +1,112 @@
+# ============================================================
+# .claudeignore — Files excluded from Claude Code's context
+# Protects the context window from large/irrelevant content.
+# ============================================================
+
+# --- Build & compiled output ---
+dist/
+build/
+out/
+.output/
+.next/
+.nuxt/
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+*.so
+*.o
+*.a
+
+# --- Dependencies & virtual environments ---
+node_modules/
+vendor/
+.venv/
+venv/
+env/
+.tox/
+
+# --- Model weights & checkpoints (multi-GB binary files) ---
+# These are the largest files in the repo — never read them
+checkpoints/
+pretrained_models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.pkl
+*.bin
+*.safetensors
+*.tflite
+*.task
+
+# --- Lock files (machine-generated, thousands of lines) ---
+uv.lock
+package-lock.json
+yarn.lock
+bun.lock
+composer.lock
+Gemfile.lock
+poetry.lock
+
+# --- Large data & media assets ---
+# SkyReels example assets (driving videos, reference images)
+skyreels/assets/driving_audio/
+skyreels/assets/driving_video/
+skyreels/assets/ref_images/
+# Binary media files anywhere
+*.mp4
+*.mp3
+*.wav
+*.flac
+*.avi
+*.mov
+*.mkv
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.ico
+*.svg
+*.ttf
+*.woff
+*.woff2
+*.eot
+
+# --- Test coverage output ---
+.coverage/
+coverage/
+htmlcov/
+.nyc_output/
+
+# --- IDE & OS files ---
+.idea/
+.vscode/settings.json
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# --- Log files ---
+*.log
+logs/
+
+# --- Cython/C build artifacts (in blend extension) ---
+ditto/ditto-talkinghead/core/utils/blend/blend_impl.c
+ditto/ditto-talkinghead/core/utils/blend/blend_impl.h
+ditto/ditto-talkinghead/core/utils/blend/*.so
+
+# --- SkyReels MediaPipe binary models ---
+skyreels/skyreels_a1/src/media_pipe/mp_models/
+
+# --- Conda environment spec (legacy, redundant with pyproject.toml) ---
+ditto/ditto-talkinghead/environment.yaml
+
+# --- Git internals ---
+.git/
+
+# --- Claude Code internals (third-party, not project code) ---
+.claude/skills/
