@@ -9,6 +9,7 @@ import sys
 import json
 import base64
 import asyncio
+import threading
 import tempfile
 import time
 import uuid
@@ -28,40 +29,43 @@ app = FastAPI(title="Chatterbox TTS API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Global model instances (lazy loaded)
-tts_model = None
 multilingual_model = None
 turbo_model = None
-model_lock = asyncio.Lock()
+_model_lock = threading.Lock()
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "chatterbox_api"
 TEMP_DIR.mkdir(exist_ok=True)
 
 
 def get_multilingual_model():
-    """Lazy load Chatterbox Multilingual model"""
+    """Lazy load Chatterbox Multilingual model (thread-safe)."""
     global multilingual_model
     if multilingual_model is None:
-        print("Loading Chatterbox Multilingual model...")
-        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-        multilingual_model = ChatterboxMultilingualTTS.from_pretrained(device="cuda")
-        print("Chatterbox Multilingual model loaded!")
+        with _model_lock:
+            if multilingual_model is None:  # double-check after acquiring lock
+                print("Loading Chatterbox Multilingual model...")
+                from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+                multilingual_model = ChatterboxMultilingualTTS.from_pretrained(device="cuda")
+                print("Chatterbox Multilingual model loaded!")
     return multilingual_model
 
 
 def get_turbo_model():
-    """Lazy load Chatterbox Turbo model"""
+    """Lazy load Chatterbox Turbo model (thread-safe)."""
     global turbo_model
     if turbo_model is None:
-        print("Loading Chatterbox Turbo model...")
-        from chatterbox.tts_turbo import ChatterboxTurboTTS
-        turbo_model = ChatterboxTurboTTS.from_pretrained(device="cuda")
-        print("Chatterbox Turbo model loaded!")
+        with _model_lock:
+            if turbo_model is None:  # double-check after acquiring lock
+                print("Loading Chatterbox Turbo model...")
+                from chatterbox.tts_turbo import ChatterboxTurboTTS
+                turbo_model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+                print("Chatterbox Turbo model loaded!")
     return turbo_model
 
 
@@ -149,7 +153,8 @@ async def generate_tts(
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[error] TTS generation failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.websocket("/ws")
@@ -189,7 +194,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                     continue
 
-                voice_data = base64.b64decode(msg["voice_prompt"])
+                voice_b64 = msg["voice_prompt"]
+                if len(voice_b64) > 50 * 1024 * 1024:
+                    await websocket.send_json({"type": "error", "message": "Voice prompt too large (max 50MB)"})
+                    continue
+                voice_data = base64.b64decode(voice_b64)
                 voice_prompt_path = session_dir / "voice_prompt.wav"
                 with open(voice_prompt_path, "wb") as f:
                     f.write(voice_data)
@@ -284,8 +293,8 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"Session {session_id} error: {e}")
         try:
             await websocket.send_json({"type": "error", "message": str(e)})
-        except:
-            pass
+        except Exception:
+            pass  # Client already disconnected, nothing to send to
     finally:
         # Cleanup session files
         import shutil

@@ -36,7 +36,7 @@ sys.path.insert(0, str(DITTO_PATH))
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import StreamingResponse, Response, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import cv2
 import librosa
@@ -56,9 +56,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # Global instances
 ditto_sdk = None
-streaming_sdk = None  # DEPRECATED: kept for backwards compat, unused
 avatar_cache: dict[str, dict] = {}  # avatar_id -> source_info
+avatar_cache_lock = threading.Lock()
 active_sessions: dict[str, dict] = {}  # session_id -> {room, video_source, output_queue, ...}
+active_sessions_lock = threading.Lock()
+
 
 CACHE_DIR = Path(os.environ.get("AVATAR_CACHE_DIR", "/workspace/avatar_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -119,6 +121,7 @@ CLIP_TYPES = ["idle", "thinking", "lookingup", "lippurse", "greeting"]
 
 # Background pre-render state: avatar_id -> {"status": "pending"|"running"|"done"|"failed", "error": ...}
 prerender_jobs: dict[str, dict] = {}
+prerender_jobs_lock = threading.Lock()
 prerender_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prerender")
 
 # Path to prerender script (SkyReels-A1) — uses its own venv since it needs different deps
@@ -138,8 +141,8 @@ class GenerateRequest(BaseModel):
     avatar_id: str
     audio_base64: Optional[str] = None
     audio_path: Optional[str] = None
-    sampling_timesteps: Optional[int] = None
-    fps: Optional[int] = None
+    sampling_timesteps: Optional[int] = Field(None, ge=1, le=50)
+    fps: Optional[int] = Field(None, ge=1, le=60)
 
 
 class TextGenerateRequest(BaseModel):
@@ -152,9 +155,28 @@ class StartSessionRequest(BaseModel):
     avatar_id: str
     livekit_url: str        # wss://lk.scoreexl.com
     livekit_token: str      # JWT for avatar participant
-    fps: int = DEFAULT_FPS
-    sampling_timesteps: int = DEFAULT_SAMPLING_TIMESTEPS
+    fps: int = Field(DEFAULT_FPS, ge=1, le=60)
+    sampling_timesteps: int = Field(DEFAULT_SAMPLING_TIMESTEPS, ge=1, le=50)
     agent_identity: str | None = None  # Identity of the agent sending audio via DataStream
+
+
+MAX_BASE64_SIZE = 50 * 1024 * 1024  # 50MB max for base64 uploads
+
+# Allowed parent directories for user-supplied file paths
+_ALLOWED_PATH_ROOTS = [CACHE_DIR, CLIPS_DIR, IMAGES_DIR, Path("/tmp"), Path("/workspace")]
+
+
+def _validate_file_path(user_path: str) -> Path:
+    """Validate a user-supplied file path against path traversal attacks.
+    Raises HTTPException if path is outside allowed directories."""
+    resolved = Path(user_path).resolve()
+    for allowed in _ALLOWED_PATH_ROOTS:
+        try:
+            resolved.relative_to(allowed.resolve())
+            return resolved
+        except ValueError:
+            continue
+    raise HTTPException(status_code=400, detail=f"Path not allowed: {user_path}")
 
 
 def _image_hash(image_path: str) -> str:
@@ -168,9 +190,12 @@ def _cache_path(avatar_id: str) -> Path:
 
 
 def _save_cache(avatar_id: str, source_info: dict):
-    """Persist source_info to disk."""
-    with open(_cache_path(avatar_id), "wb") as f:
+    """Persist source_info to disk atomically (write to .tmp, then rename)."""
+    final_path = _cache_path(avatar_id)
+    tmp_path = final_path.with_suffix(".pkl.tmp")
+    with open(tmp_path, "wb") as f:
         pickle.dump(source_info, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp_path.replace(final_path)
 
 
 def _load_cache(avatar_id: str) -> dict | None:
@@ -189,7 +214,9 @@ def _warm_load_all():
         avatar_id = pkl_file.stem
         try:
             with open(pkl_file, "rb") as f:
-                avatar_cache[avatar_id] = pickle.load(f)
+                data = pickle.load(f)
+            with avatar_cache_lock:
+                avatar_cache[avatar_id] = data
             print(f"  Loaded cached avatar: {avatar_id}")
         except Exception as e:
             print(f"  Failed to load cache {pkl_file}: {e}")
@@ -456,14 +483,16 @@ def _register_avatar(sdk, image_path: str, avatar_id: str | None = None) -> tupl
         avatar_id = _image_hash(image_path)
 
     # Check memory cache first
-    if avatar_id in avatar_cache:
-        print(f"Avatar {avatar_id} already cached (memory)")
-        return avatar_id, avatar_cache[avatar_id]
+    with avatar_cache_lock:
+        if avatar_id in avatar_cache:
+            print(f"Avatar {avatar_id} already cached (memory)")
+            return avatar_id, avatar_cache[avatar_id]
 
     # Check disk cache
     cached = _load_cache(avatar_id)
     if cached is not None:
-        avatar_cache[avatar_id] = cached
+        with avatar_cache_lock:
+            avatar_cache[avatar_id] = cached
         print(f"Avatar {avatar_id} loaded from disk cache")
         return avatar_id, cached
 
@@ -475,7 +504,8 @@ def _register_avatar(sdk, image_path: str, avatar_id: str | None = None) -> tupl
     print(f"Registration complete in {elapsed:.2f}s")
 
     # Cache in memory + disk
-    avatar_cache[avatar_id] = source_info
+    with avatar_cache_lock:
+        avatar_cache[avatar_id] = source_info
     _save_cache(avatar_id, source_info)
 
     # Persist source image for background pre-render
@@ -516,10 +546,12 @@ def _ensure_skyreels_setup(avatar_id: str) -> bool:
     setup_script = SKYREELS_PATH / "setup.sh"
     if not setup_script.exists():
         print(f"[prerender] ERROR: {setup_script} not found — cannot auto-setup SkyReels-A1")
-        prerender_jobs[avatar_id] = {"status": "failed", "error": "setup.sh not found"}
+        with prerender_jobs_lock:
+            prerender_jobs[avatar_id] = {"status": "failed", "error": "setup.sh not found"}
         return False
 
-    prerender_jobs[avatar_id] = {"status": "setting_up", "started": time.time()}
+    with prerender_jobs_lock:
+        prerender_jobs[avatar_id] = {"status": "setting_up", "started": time.time()}
     print(f"[prerender] Running one-time SkyReels-A1 setup (may take 15-20 min)...")
 
     try:
@@ -532,15 +564,18 @@ def _ensure_skyreels_setup(avatar_id: str) -> bool:
         )
         if result.returncode != 0:
             print(f"[prerender] Setup failed: {result.stderr[-500:]}")
-            prerender_jobs[avatar_id] = {"status": "failed", "error": f"setup failed: {result.stderr[-300:]}"}
+            with prerender_jobs_lock:
+                prerender_jobs[avatar_id] = {"status": "failed", "error": f"setup failed: {result.stderr[-300:]}"}
             return False
         print(f"[prerender] SkyReels-A1 setup complete.")
         return True
     except subprocess.TimeoutExpired:
-        prerender_jobs[avatar_id] = {"status": "failed", "error": "setup timeout (1hr)"}
+        with prerender_jobs_lock:
+            prerender_jobs[avatar_id] = {"status": "failed", "error": "setup timeout (1hr)"}
         return False
     except Exception as e:
-        prerender_jobs[avatar_id] = {"status": "failed", "error": f"setup error: {e}"}
+        with prerender_jobs_lock:
+            prerender_jobs[avatar_id] = {"status": "failed", "error": f"setup error: {e}"}
         return False
 
 
@@ -551,7 +586,8 @@ def _run_prerender(avatar_id: str, image_path: str):
         if not _ensure_skyreels_setup(avatar_id):
             return
 
-        prerender_jobs[avatar_id] = {"status": "running", "started": time.time()}
+        with prerender_jobs_lock:
+            prerender_jobs[avatar_id] = {"status": "running", "started": time.time()}
         print(f"[prerender] Starting background clip generation for {avatar_id}")
 
         cmd = [
@@ -574,34 +610,40 @@ def _run_prerender(avatar_id: str, image_path: str):
         )
 
         if result.returncode == 0:
-            prerender_jobs[avatar_id] = {"status": "done", "finished": time.time()}
+            with prerender_jobs_lock:
+                prerender_jobs[avatar_id] = {"status": "done", "finished": time.time()}
             print(f"[prerender] Clips ready for {avatar_id}")
         else:
-            prerender_jobs[avatar_id] = {
-                "status": "failed",
-                "error": result.stderr[-500:] if result.stderr else "unknown error",
-            }
+            with prerender_jobs_lock:
+                prerender_jobs[avatar_id] = {
+                    "status": "failed",
+                    "error": result.stderr[-500:] if result.stderr else "unknown error",
+                }
             print(f"[prerender] Failed for {avatar_id}: {result.stderr[-200:]}")
 
     except subprocess.TimeoutExpired:
-        prerender_jobs[avatar_id] = {"status": "failed", "error": "timeout (30min)"}
+        with prerender_jobs_lock:
+            prerender_jobs[avatar_id] = {"status": "failed", "error": "timeout (30min)"}
         print(f"[prerender] Timeout for {avatar_id}")
     except Exception as e:
-        prerender_jobs[avatar_id] = {"status": "failed", "error": str(e)}
+        with prerender_jobs_lock:
+            prerender_jobs[avatar_id] = {"status": "failed", "error": str(e)}
         print(f"[prerender] Error for {avatar_id}: {e}")
 
 
 def _start_prerender(avatar_id: str, image_path: str):
     """Submit a pre-render job to the background executor."""
-    if avatar_id in prerender_jobs and prerender_jobs[avatar_id]["status"] in ("running", "done"):
-        return  # already running or finished
+    with prerender_jobs_lock:
+        if avatar_id in prerender_jobs and prerender_jobs[avatar_id]["status"] in ("running", "done"):
+            return  # already running or finished
 
     # Save image persistently so the background process can access it
     persistent_path = _avatar_image_path(avatar_id)
     if not persistent_path.exists():
         shutil.copy2(image_path, persistent_path)
 
-    prerender_jobs[avatar_id] = {"status": "pending"}
+    with prerender_jobs_lock:
+        prerender_jobs[avatar_id] = {"status": "pending"}
     prerender_executor.submit(_run_prerender, avatar_id, str(persistent_path))
 
 
@@ -617,8 +659,32 @@ def _estimate_size_mb(source_info: dict) -> float:
 
 # ---------- Pre-rendered clip playback ----------
 
-# Decoded clip frames cached in memory: clip_file_path -> [RGB numpy arrays]
+# Decoded clip frames cached in memory with LRU eviction to prevent OOM.
+# Max 20 clips (~1GB at 512x340 resolution). Oldest-accessed evicted first.
+_CLIP_CACHE_MAX = int(os.environ.get("CLIP_CACHE_MAX", "20"))
 _clip_frame_cache: dict[str, list[np.ndarray]] = {}
+_clip_cache_order: list[str] = []  # LRU order: most-recently-used at end
+
+
+def _clip_cache_put(key: str, frames: list[np.ndarray]):
+    """Insert into clip cache with LRU eviction."""
+    if key in _clip_frame_cache:
+        _clip_cache_order.remove(key)
+    _clip_frame_cache[key] = frames
+    _clip_cache_order.append(key)
+    # Evict oldest entries if over limit
+    while len(_clip_cache_order) > _CLIP_CACHE_MAX:
+        evict_key = _clip_cache_order.pop(0)
+        _clip_frame_cache.pop(evict_key, None)
+
+
+def _clip_cache_get(key: str) -> list[np.ndarray] | None:
+    """Get from clip cache and mark as recently used."""
+    if key in _clip_frame_cache:
+        _clip_cache_order.remove(key)
+        _clip_cache_order.append(key)
+        return _clip_frame_cache[key]
+    return None
 
 
 def _get_clip_variants(avatar_id: str, clip_type: str) -> list[Path]:
@@ -674,18 +740,21 @@ def _load_avatar_clips(avatar_id: str, clip_type: str = "idle") -> list[list[np.
     result = []
     for clip_path in variants:
         cache_key = str(clip_path)
-        if cache_key not in _clip_frame_cache:
+        cached = _clip_cache_get(cache_key)
+        if cached is None:
             frames = _decode_clip_frames(clip_path)
             if frames:
                 # Crop and resize to match avatar output resolution
-                ref_img = avatar_cache[avatar_id]["img_rgb_lst"][0]
+                with avatar_cache_lock:
+                    ref_img = avatar_cache[avatar_id]["img_rgb_lst"][0]
                 target_h, target_w = ref_img.shape[:2]
                 if frames[0].shape[:2] != (target_h, target_w):
                     frames = [_crop_resize_to_fill(f, target_w, target_h) for f in frames]
-                _clip_frame_cache[cache_key] = frames
+                _clip_cache_put(cache_key, frames)
+                cached = frames
                 print(f"[clips] Loaded {clip_path.name}: {len(frames)} frames")
-        if cache_key in _clip_frame_cache:
-            result.append(_clip_frame_cache[cache_key])
+        if cached is not None:
+            result.append(cached)
     return result
 
 
@@ -799,8 +868,15 @@ def _generate_video_from_text(sdk, avatar_id: str, text: str, voice: str = "tara
 
     # 5. Merge video + audio (needed for /generate_from_text since client plays MP4 directly)
     raw_video = tmp_output + ".tmp.mp4"
-    cmd = f'ffmpeg -loglevel error -y -i "{raw_video}" -i "{audio_output}" -map 0:v -map 1:a -c:v copy -c:a aac "{final_output}"'
-    os.system(cmd)
+    ffmpeg_result = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y",
+         "-i", raw_video, "-i", audio_output,
+         "-map", "0:v", "-map", "1:a",
+         "-c:v", "copy", "-c:a", "aac", final_output],
+        capture_output=True, text=True,
+    )
+    if ffmpeg_result.returncode != 0:
+        print(f"[pipeline] ffmpeg merge failed: {ffmpeg_result.stderr[:500]}")
 
     for f_path in [raw_video, audio_output]:
         if os.path.exists(f_path):
@@ -873,9 +949,10 @@ async def list_avatars():
 @app.delete("/avatars/{avatar_id}")
 async def delete_avatar(avatar_id: str):
     """Evict an avatar from memory, disk cache, and clips."""
-    removed_memory = avatar_id in avatar_cache
-    if removed_memory:
-        del avatar_cache[avatar_id]
+    with avatar_cache_lock:
+        removed_memory = avatar_id in avatar_cache
+        if removed_memory:
+            del avatar_cache[avatar_id]
 
     removed_disk = False
     disk_path = _cache_path(avatar_id)
@@ -893,12 +970,15 @@ async def delete_avatar(avatar_id: str):
     # Evict decoded frames from memory
     for key in list(_clip_frame_cache.keys()):
         if avatar_id in key:
-            del _clip_frame_cache[key]
+            _clip_frame_cache.pop(key, None)
+            if key in _clip_cache_order:
+                _clip_cache_order.remove(key)
     img_path = _avatar_image_path(avatar_id)
     if img_path.exists():
         img_path.unlink()
 
-    prerender_jobs.pop(avatar_id, None)
+    with prerender_jobs_lock:
+        prerender_jobs.pop(avatar_id, None)
 
     if not removed_memory and not removed_disk:
         raise HTTPException(status_code=404, detail=f"Avatar {avatar_id} not found")
@@ -966,15 +1046,17 @@ async def register_avatar(request: RegisterAvatarRequest):
 
     try:
         if request.image_base64:
+            if len(request.image_base64) > MAX_BASE64_SIZE:
+                raise HTTPException(status_code=413, detail=f"Image too large (max {MAX_BASE64_SIZE // 1024 // 1024}MB)")
             img_data = base64.b64decode(request.image_base64)
             temp_path = "/tmp/avatar_temp.png"
             with open(temp_path, "wb") as f:
                 f.write(img_data)
             image_path = temp_path
         elif request.image_path:
-            if not os.path.exists(request.image_path):
-                raise HTTPException(status_code=400, detail=f"Image not found: {request.image_path}")
-            image_path = request.image_path
+            image_path = str(_validate_file_path(request.image_path))
+            if not os.path.exists(image_path):
+                raise HTTPException(status_code=400, detail="Image not found at provided path")
         else:
             raise HTTPException(status_code=400, detail="No image provided")
 
@@ -994,7 +1076,8 @@ async def register_avatar(request: RegisterAvatarRequest):
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[error] Internal error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/avatars/{avatar_id}/resolution")
@@ -1099,7 +1182,8 @@ async def generate_from_text(request: TextGenerateRequest):
         video_data = _generate_video_from_text(sdk, request.avatar_id, request.text, request.voice)
         return Response(content=video_data, media_type="video/mp4")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[error] Internal error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/generate")
@@ -1112,12 +1196,14 @@ async def generate_video(request: GenerateRequest):
 
     try:
         if request.audio_base64:
+            if len(request.audio_base64) > MAX_BASE64_SIZE:
+                raise HTTPException(status_code=413, detail=f"Audio too large (max {MAX_BASE64_SIZE // 1024 // 1024}MB)")
             audio_data = base64.b64decode(request.audio_base64)
             audio_path = "/tmp/audio_temp.wav"
             with open(audio_path, "wb") as f:
                 f.write(audio_data)
         elif request.audio_path:
-            audio_path = request.audio_path
+            audio_path = str(_validate_file_path(request.audio_path))
         else:
             raise HTTPException(status_code=400, detail="No audio provided")
 
@@ -1133,7 +1219,8 @@ async def generate_video(request: GenerateRequest):
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[error] Internal error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 def _rgb_to_rgba(rgb: np.ndarray) -> np.ndarray:
@@ -1759,30 +1846,31 @@ async def start_session(request: StartSessionRequest):
             video_queue_size_ms=100,
         )
 
-        active_sessions[session_id] = {
-            "room": room,
-            "video_source": video_source,
-            "video_track": video_track,
-            "audio_source": audio_source,
-            "audio_track": audio_track,
-            "av_sync": av_sync,
-            "avatar_id": request.avatar_id,
-            "fps": request.fps,
-            "sampling_timesteps": request.sampling_timesteps,
-            "publish_w": pub_w,
-            "publish_h": pub_h,
-            "output_queue": None,  # set by audio receiver to trigger speech mode
-            "publisher_task": None,
-            "audio_recv_task": None,
-            # Incremental audio buffer — 24kHz int16 PCM
-            "audio_24k_chunks": [],
-            "audio_24k_buffer": None,
-            "audio_24k_total_samples": 0,
-            "audio_24k_dirty": False,
-            "_total_frames_published": 0,
-            "_speech_done_event": asyncio.Event(),
-            "_speech_interrupted": False,
-        }
+        with active_sessions_lock:
+            active_sessions[session_id] = {
+                "room": room,
+                "video_source": video_source,
+                "video_track": video_track,
+                "audio_source": audio_source,
+                "audio_track": audio_track,
+                "av_sync": av_sync,
+                "avatar_id": request.avatar_id,
+                "fps": request.fps,
+                "sampling_timesteps": request.sampling_timesteps,
+                "publish_w": pub_w,
+                "publish_h": pub_h,
+                "output_queue": None,  # set by audio receiver to trigger speech mode
+                "publisher_task": None,
+                "audio_recv_task": None,
+                # Incremental audio buffer — 24kHz int16 PCM
+                "audio_24k_chunks": [],
+                "audio_24k_buffer": None,
+                "audio_24k_total_samples": 0,
+                "audio_24k_dirty": False,
+                "_total_frames_published": 0,
+                "_speech_done_event": asyncio.Event(),
+                "_speech_interrupted": False,
+            }
 
         # Auto-stop session when agent or room disconnects (handles crashes/abrupt drops)
         agent_identity_for_disconnect = request.agent_identity
@@ -1824,12 +1912,14 @@ async def start_session(request: StartSessionRequest):
 
     except Exception as e:
         print(f"[stream] Failed to start session: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to connect to LiveKit room: {e}")
+        print(f"[error] Failed to connect to LiveKit room: {e}")
+        raise HTTPException(status_code=500, detail="Failed to connect to LiveKit room")
 
 
 async def _auto_stop_session(session_id: str):
     """Shared cleanup used by both /stop_session and auto-disconnect handlers."""
-    session = active_sessions.pop(session_id, None)
+    with active_sessions_lock:
+        session = active_sessions.pop(session_id, None)
     if session is None:
         return
     try:
@@ -1854,9 +1944,14 @@ async def stop_session(session_id: str):
     return {"session_id": session_id, "status": "stopped"}
 
 
+_DEBUG_ENDPOINTS = os.environ.get("DITTO_DEBUG_ENDPOINTS", "1") == "1"
+
+
 @app.get("/test_viewer")
 async def test_viewer():
-    """Serve the bare-bones frame viewer HTML page."""
+    """Serve the bare-bones frame viewer HTML page. Disabled in production (DITTO_DEBUG_ENDPOINTS=0)."""
+    if not _DEBUG_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="Debug endpoints disabled")
     html_path = Path(__file__).resolve().parent / "test_viewer.html"
     return HTMLResponse(html_path.read_text())
 
@@ -1867,11 +1962,16 @@ async def ws_test_frames(ws: WebSocket, avatar_id: str = "imogen", duration: flo
 
     No LiveKit involved — pure Ditto pipeline → JPEG → WebSocket → browser canvas.
     This isolates whether the speed issue is in Ditto or in LiveKit/WebRTC.
+    Disabled in production (DITTO_DEBUG_ENDPOINTS=0).
     """
     import json as _json
     import queue as queue_mod
 
     await ws.accept()
+    if not _DEBUG_ENDPOINTS:
+        await ws.send_json({"type": "error", "message": "Debug endpoints disabled"})
+        await ws.close()
+        return
 
     if avatar_id not in avatar_cache:
         await ws.send_text(_json.dumps({"type": "error", "msg": f"Avatar {avatar_id} not found"}))
@@ -1953,4 +2053,5 @@ async def ws_test_frames(ws: WebSocket, avatar_id: str = "imogen", duration: flo
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8181)
+    port = int(os.environ.get("DITTO_PORT", "8181"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

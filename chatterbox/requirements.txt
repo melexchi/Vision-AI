@@ -1,7 +1,7 @@
-chatterbox-tts
-torch
-torchaudio
-fastapi
-uvicorn[standard]
-websockets
-python-multipart
+chatterbox-tts>=0.1.0,<1.0
+torch>=2.0.0,<3.0
+torchaudio>=2.0.0,<3.0
+fastapi>=0.100.0,<1.0
+uvicorn[standard]>=0.20.0,<1.0
+websockets>=11.0,<14.0
+python-multipart>=0.0.5,<1.0

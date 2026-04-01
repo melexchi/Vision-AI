@@ -99,10 +99,10 @@ class StreamSDK:
 
         # Apply fade-out alpha ramp: 1.0 → 0.0 over fade_out frames
         if fade_out > 0:
-            fade_start = num_driving_frames - fade_out - 1
+            fade_start = num_driving_frames - fade_out
             fade_end = num_driving_frames - 1
             for frame_idx in range(fade_start, num_driving_frames):
-                alpha = max((fade_end - frame_idx) / (fade_end - fade_start), 0)
+                alpha = max((fade_end - frame_idx) / max(fade_end - fade_start, 1), 0)
                 frame_ctrl = ctrl_info.get(frame_idx, {})
                 frame_ctrl["fade_alpha"] = alpha
                 ctrl_info[frame_idx] = frame_ctrl
@@ -718,12 +718,15 @@ class StreamSDK:
 
     def close(self):
         """Flush pipeline, wait for all workers, and finalize output."""
-        # Signal end of audio stream
+        # Signal stop first so workers exit their loops, then send sentinel
+        self.stop_event.set()
         self.audio2motion_queue.put(None)
 
-        # Wait for all worker threads to complete
+        # Wait for all worker threads with timeout to prevent deadlock
         for thread in self.thread_list:
-            thread.join()
+            thread.join(timeout=10)
+            if thread.is_alive():
+                print(f"WARNING: Worker thread {thread.name} did not exit within 10s")
 
         try:
             self.writer.close()

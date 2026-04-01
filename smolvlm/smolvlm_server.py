@@ -33,13 +33,14 @@ def get_model():
         except ImportError:
             from transformers import AutoModelForVision2Seq as AutoModelForImageTextToText
 
-        model_id = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
+        model_id = os.environ.get("SMOLVLM_MODEL", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
+        device = os.environ.get("SMOLVLM_DEVICE", "cuda:0")
 
         vlm_processor = AutoProcessor.from_pretrained(model_id)
         vlm_model = AutoModelForImageTextToText.from_pretrained(
             model_id,
             dtype=torch.float16,
-            device_map="cuda:0"
+            device_map=device,
         )
         vlm_model.eval()
         
@@ -66,11 +67,22 @@ async def query_image(request: ImageQueryRequest):
         model, processor = get_model()
         
         # Get image
+        MAX_BASE64_SIZE = 50 * 1024 * 1024  # 50MB
         if request.image_base64:
+            if len(request.image_base64) > MAX_BASE64_SIZE:
+                raise HTTPException(status_code=413, detail="Image too large (max 50MB)")
             image_data = base64.b64decode(request.image_base64)
             image = process_image(image_data)
         elif request.image_url:
-            async with httpx.AsyncClient() as client:
+            # Block SSRF: reject private/internal URLs
+            from urllib.parse import urlparse
+            parsed = urlparse(request.image_url)
+            hostname = parsed.hostname or ""
+            if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or \
+               hostname.startswith("10.") or hostname.startswith("172.") or \
+               hostname.startswith("192.168.") or hostname.endswith(".internal"):
+                raise HTTPException(status_code=400, detail="Internal URLs not allowed")
+            async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(request.image_url)
                 image = process_image(resp.content)
         else:
@@ -116,7 +128,7 @@ async def query_image(request: ImageQueryRequest):
     except Exception as e:
         return JSONResponse({
             "success": False,
-            "error": str(e)
+            "error": "Internal server error"
         }, status_code=500)
 
 @app.post("/v1/query/upload")
@@ -174,7 +186,7 @@ async def query_image_upload(
     except Exception as e:
         return JSONResponse({
             "success": False,
-            "error": str(e)
+            "error": "Internal server error"
         }, status_code=500)
 
 @app.post("/v1/unload")
@@ -191,4 +203,5 @@ async def unload_model():
     return {"status": "unloaded"}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8282)
+    port = int(os.environ.get("SMOLVLM_PORT", "8282"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
